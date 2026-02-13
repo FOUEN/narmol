@@ -13,7 +13,7 @@ import (
 	subfinder_cmd "github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
 	gau_cmd "github.com/lc/gau/v2/cmd/gau"
 )
-
+//comit
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
