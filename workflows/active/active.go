@@ -47,7 +47,7 @@ func (w *ActiveWorkflow) Run(domain string, s *scope.Scope, opts workflows.Outpu
 		return fmt.Errorf("active workflow requires a wildcard scope (*.%s) to invoke subdomain enumeration", domain)
 	}
 
-	// Temp directory for the FIFO and httpx output
+	// Temp directory for the FIFO
 	tmpDir, err := os.MkdirTemp("", "narmol-active-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temp dir: %w", err)
@@ -61,16 +61,33 @@ func (w *ActiveWorkflow) Run(domain string, s *scope.Scope, opts workflows.Outpu
 		return fmt.Errorf("failed to create FIFO: %w", err)
 	}
 
-	activeFile := filepath.Join(tmpDir, "active.json")
-
 	// Counters for the summary line
 	var totalFound int64
 	var inScope int64
 	var excluded int64
+	var activeCount int64
+
+	// Open output files up front so we can stream results into them.
+	var textFile, jsonFile *os.File
+	if opts.TextFile != "" {
+		textFile, err = os.OpenFile(opts.TextFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to open text output file %s: %w", opts.TextFile, err)
+		}
+		defer textFile.Close()
+	}
+	if opts.JSONFile != "" {
+		jsonFile, err = os.OpenFile(opts.JSONFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to open JSON output file %s: %w", opts.JSONFile, err)
+		}
+		defer jsonFile.Close()
+	}
 
 	// Goroutine: httpx (consumer)
 	// httpx opens the FIFO for reading in Stream mode. It blocks until the
 	// writer (subfinder goroutine) also opens the FIFO.
+	// OnResult streams each result to output files/stdout in real time.
 	var httpxErr error
 	var httpxWg sync.WaitGroup
 	httpxWg.Add(1)
@@ -80,9 +97,8 @@ func (w *ActiveWorkflow) Run(domain string, s *scope.Scope, opts workflows.Outpu
 
 		hxOptions := &httpx_runner.Options{
 			InputFile:          fifoPath,
-			JSONOutput:         true,
-			Output:             activeFile,
 			Silent:             true,
+			DisableStdout:      true,
 			Stream:             true,
 			Threads:            50,
 			Timeout:            10,
@@ -95,6 +111,32 @@ func (w *ActiveWorkflow) Run(domain string, s *scope.Scope, opts workflows.Outpu
 			Retries:            0,
 			HostMaxErrors:      30,
 			RandomAgent:        true,
+			TechDetect:         true,
+			OutputCDN:          "true",
+			ExtractTitle:       true,
+			OnResult: func(r httpx_runner.Result) {
+				if r.Err != nil {
+					return
+				}
+				// Compact the full httpx result to essential fields
+				compact := compactFromResult(r)
+				atomic.AddInt64(&activeCount, 1)
+
+				// Stream to stdout (default)
+				if textFile == nil && jsonFile == nil {
+					fmt.Println(compact.URL)
+				}
+				// Stream to text file
+				if textFile != nil {
+					fmt.Fprintln(textFile, compact.URL)
+				}
+				// Stream to JSON file
+				if jsonFile != nil {
+					if js, err := json.Marshal(compact); err == nil {
+						fmt.Fprintln(jsonFile, string(js))
+					}
+				}
+			},
 		}
 
 		if err := hxOptions.ValidateOptions(); err != nil {
@@ -194,74 +236,16 @@ func (w *ActiveWorkflow) Run(domain string, s *scope.Scope, opts workflows.Outpu
 		return fmt.Errorf("no subdomains remaining after scope filtering")
 	}
 
-	// Process output
-	fmt.Println("[*] Processing results...")
+	active := atomic.LoadInt64(&activeCount)
 
-	activeData, err := os.ReadFile(activeFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			fmt.Println("[!] No active hosts found.")
-			return nil
-		}
-		return fmt.Errorf("failed to read active results: %w", err)
-	}
-
-	// Parse httpx JSONL and keep only essential fields for the active workflow.
-	// Other workflows (tech, vuln, etc.) will provide deeper detail.
-	var activeURLs []string
-	var cleanLines []string
-
-	for _, line := range strings.Split(string(activeData), "\n") {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-
-		clean, url := compactResult(line)
-		if url == "" {
-			continue
-		}
-		activeURLs = append(activeURLs, url)
-		cleanLines = append(cleanLines, clean)
-	}
-
-	// JSON file output
 	if opts.JSONFile != "" {
-		f, err := os.OpenFile(opts.JSONFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			return fmt.Errorf("failed to open JSON output file %s: %w", opts.JSONFile, err)
-		}
-		defer f.Close()
-		for _, cl := range cleanLines {
-			fmt.Fprintln(f, cl)
-		}
-		fmt.Printf("[+] JSON results appended to: %s\n", opts.JSONFile)
+		fmt.Printf("[+] JSON results streamed to: %s\n", opts.JSONFile)
 	}
-
-	// Text file output
 	if opts.TextFile != "" {
-		content := strings.Join(activeURLs, "\n")
-		if len(activeURLs) > 0 {
-			content += "\n"
-		}
-		f, err := os.OpenFile(opts.TextFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			return fmt.Errorf("failed to open text output file %s: %w", opts.TextFile, err)
-		}
-		defer f.Close()
-		if _, err := f.WriteString(content); err != nil {
-			return fmt.Errorf("failed to write text output to %s: %w", opts.TextFile, err)
-		}
-		fmt.Printf("[+] Text results appended to: %s\n", opts.TextFile)
+		fmt.Printf("[+] Text results streamed to: %s\n", opts.TextFile)
 	}
 
-	// Stdout (default when no file output requested)
-	if opts.TextFile == "" && opts.JSONFile == "" {
-		for _, url := range activeURLs {
-			fmt.Println(url)
-		}
-	}
-
-	fmt.Printf("[+] Workflow 'active' completed -- %d active hosts found.\n", len(activeURLs))
+	fmt.Printf("[+] Workflow 'active' completed -- %d active hosts found.\n", active)
 	return nil
 }
 
@@ -281,8 +265,27 @@ type activeResult struct {
 	CDNName    string   `json:"cdn_name,omitempty"`
 }
 
+// compactFromResult converts a full httpx Result struct into a compact
+// activeResult keeping only fields relevant for the active workflow.
+func compactFromResult(r httpx_runner.Result) activeResult {
+	return activeResult{
+		URL:        r.URL,
+		Input:      r.Input,
+		Host:       r.Host,
+		Port:       r.Port,
+		Scheme:     r.Scheme,
+		StatusCode: r.StatusCode,
+		Title:      r.Title,
+		Webserver:  r.WebServer,
+		Tech:       r.Technologies,
+		CDN:        r.CDN,
+		CDNName:    r.CDNName,
+	}
+}
+
 // compactResult parses a full httpx JSON line and returns a compact JSON string
 // with only the fields relevant for the active workflow, plus the URL.
+// Used by tests and as a fallback for JSON line processing.
 func compactResult(jsonLine string) (string, string) {
 	var full map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(jsonLine), &full); err != nil {
