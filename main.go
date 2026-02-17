@@ -8,13 +8,14 @@ import (
 
 	// Imported tools (refactored to expose Main)
 	dnsx_cmd "github.com/projectdiscovery/dnsx/cmd/dnsx"
+	gau_cmd "github.com/lc/gau/v2/cmd/gau"
 	httpx_cmd "github.com/projectdiscovery/httpx/cmd/httpx"
 	katana_cmd "github.com/projectdiscovery/katana/cmd/katana"
 	nuclei_cmd "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"
 	subfinder_cmd "github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
-	gau_cmd "github.com/lc/gau/v2/cmd/gau"
 
-	// Workflows
+	// Scope & Workflows
+	"narmol/scope"
 	"narmol/workflows"
 	_ "narmol/workflows/active" // auto-register active workflow
 )
@@ -69,16 +70,35 @@ func runWorkflow(args []string) {
 
 	// Parse workflow flags
 	fs := flag.NewFlagSet("workflow", flag.ExitOnError)
-	domain := fs.String("d", "", "Target domain")
+	var scopeFile string
+	fs.StringVar(&scopeFile, "scope", "", "Scope file (required) — defines allowed targets")
+	fs.StringVar(&scopeFile, "s", "", "Scope file (required) — shorthand for --scope")
 	outputDir := fs.String("o", "./output", "Output directory")
 	fs.Parse(args[1:])
 
-	if *domain == "" {
-		fmt.Println("Error: -d (domain) is required")
-		fmt.Printf("Usage: narmol workflow %s -d <domain> [-o <output_dir>]\n", name)
+	// Validate required flags
+	if scopeFile == "" {
+		fmt.Println("Error: --scope / -s is required. You must define a scope file.")
+		fmt.Println()
+		fmt.Println("Example scope.txt:")
+		fmt.Println("  *.example.com          # all subdomains")
+		fmt.Println("  -admin.example.com     # exclude admin")
+		fmt.Println()
+		fmt.Printf("Usage: narmol workflow %s --scope <scope.txt> [-o <output_dir>]\n", name)
 		os.Exit(1)
 	}
 
+	// Load scope
+	s, err := scope.LoadFromFile(scopeFile)
+	if err != nil {
+		fmt.Printf("[!] Scope error: %s\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println(s.String())
+	fmt.Printf("[*] Target domains: %s\n", strings.Join(s.Domains(), ", "))
+
+	// Get workflow
 	w, err := workflows.Get(name)
 	if err != nil {
 		fmt.Printf("Error: %s\n", err)
@@ -86,8 +106,8 @@ func runWorkflow(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("[*] Running workflow '%s' for domain: %s\n", name, *domain)
-	if err := w.Run(*domain, *outputDir); err != nil {
+	fmt.Printf("[*] Running workflow '%s'\n", name)
+	if err := w.Run(*outputDir, s); err != nil {
 		fmt.Printf("[!] Workflow failed: %s\n", err)
 		os.Exit(1)
 	}
@@ -99,7 +119,7 @@ func printWorkflows() {
 		fmt.Printf("  - %-12s %s\n", w.Name(), w.Description())
 	}
 	fmt.Println()
-	fmt.Println("Usage: narmol workflow <name> -d <domain> [-o <output_dir>]")
+	fmt.Println("Usage: narmol workflow <name> --scope <scope.txt> [-o <output_dir>]")
 }
 
 func printUsage() {
@@ -115,7 +135,7 @@ func printUsage() {
 	fmt.Println("  gau          Run gau URL fetcher")
 	fmt.Println()
 	fmt.Println("Workflows:")
-	fmt.Println("  workflow     Run a predefined workflow")
+	fmt.Println("  workflow     Run a predefined workflow (requires --scope)")
 	fmt.Println()
 	fmt.Println("Run 'narmol workflow' to see available workflows.")
 }

@@ -7,11 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 
+	"narmol/scope"
 	"narmol/workflows"
 
 	"github.com/projectdiscovery/goflags"
-	subfinder_runner "github.com/projectdiscovery/subfinder/v2/pkg/runner"
 	httpx_runner "github.com/projectdiscovery/httpx/runner"
+	subfinder_runner "github.com/projectdiscovery/subfinder/v2/pkg/runner"
 )
 
 func init() {
@@ -19,7 +20,7 @@ func init() {
 }
 
 // ActiveWorkflow finds all subdomains for a domain and probes which ones are active.
-// All outputs are in JSON format.
+// All outputs are in JSON format. Results are filtered by scope.
 type ActiveWorkflow struct{}
 
 func (w *ActiveWorkflow) Name() string {
@@ -30,18 +31,19 @@ func (w *ActiveWorkflow) Description() string {
 	return "Find all subdomains and check which are active (alive). Output: JSON."
 }
 
-func (w *ActiveWorkflow) Run(domain string, outputDir string) error {
+func (w *ActiveWorkflow) Run(domain string, outputDir string, s *scope.Scope) error {
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
 
 	subdomainsFile := filepath.Join(outputDir, "subdomains.json")
+	hostsFile := filepath.Join(outputDir, "hosts.txt")
 	activeFile := filepath.Join(outputDir, "active.json")
 
 	// ──────────────────────────────────────────────
 	// Step 1: Subfinder — discover subdomains
 	// ──────────────────────────────────────────────
-	fmt.Println("[*] Step 1/2: Running subfinder to discover subdomains...")
+	fmt.Println("[*] Step 1/3: Running subfinder to discover subdomains...")
 
 	sfOptions := &subfinder_runner.Options{
 		Domain:             goflags.StringSlice{domain},
@@ -75,16 +77,34 @@ func (w *ActiveWorkflow) Run(domain string, outputDir string) error {
 	fmt.Printf("[+] Subdomains saved to: %s\n", subdomainsFile)
 
 	// ──────────────────────────────────────────────
-	// Step 2: Httpx — probe active subdomains
+	// Step 2: Scope filtering
 	// ──────────────────────────────────────────────
-	fmt.Println("[*] Step 2/2: Running httpx to find active subdomains...")
+	fmt.Println("[*] Step 2/3: Filtering subdomains by scope...")
 
-	// httpx reads JSONL input — we need to extract hosts from the subfinder JSON output
-	// and create a plain list for httpx, or use the jsonl input directly
-	hostsFile := filepath.Join(outputDir, "hosts.txt")
-	if err := extractHostsFromSubfinderJSON(subdomainsFile, hostsFile); err != nil {
+	hosts, err := extractHostsFromSubfinderJSON(subdomainsFile)
+	if err != nil {
 		return fmt.Errorf("could not extract hosts from subfinder output: %w", err)
 	}
+
+	originalCount := len(hosts)
+	hosts = s.FilterHosts(hosts)
+	filteredOut := originalCount - len(hosts)
+
+	fmt.Printf("[+] Scope filter: %d in scope, %d excluded\n", len(hosts), filteredOut)
+
+	if len(hosts) == 0 {
+		return fmt.Errorf("no subdomains remaining after scope filtering")
+	}
+
+	// Write filtered hosts for httpx
+	if err := os.WriteFile(hostsFile, []byte(strings.Join(hosts, "\n")+"\n"), 0644); err != nil {
+		return fmt.Errorf("could not write hosts file: %w", err)
+	}
+
+	// ──────────────────────────────────────────────
+	// Step 3: Httpx — probe active subdomains
+	// ──────────────────────────────────────────────
+	fmt.Println("[*] Step 3/3: Running httpx to find active subdomains...")
 
 	hxOptions := &httpx_runner.Options{
 		InputFile:          hostsFile,
@@ -121,12 +141,11 @@ func (w *ActiveWorkflow) Run(domain string, outputDir string) error {
 	return nil
 }
 
-// extractHostsFromSubfinderJSON reads subfinder JSONL output and extracts just the host field
-// into a plain text file (one host per line) for httpx to consume.
-func extractHostsFromSubfinderJSON(jsonlFile, hostsFile string) error {
+// extractHostsFromSubfinderJSON reads subfinder JSONL output and extracts host fields.
+func extractHostsFromSubfinderJSON(jsonlFile string) ([]string, error) {
 	data, err := os.ReadFile(jsonlFile)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var hosts []string
@@ -135,8 +154,6 @@ func extractHostsFromSubfinderJSON(jsonlFile, hostsFile string) error {
 		if line == "" {
 			continue
 		}
-		// subfinder JSON lines contain {"host":"sub.example.com",...}
-		// Simple extraction without full JSON parse — find "host" value
 		host := extractJSONField(line, "host")
 		if host != "" {
 			hosts = append(hosts, host)
@@ -144,19 +161,17 @@ func extractHostsFromSubfinderJSON(jsonlFile, hostsFile string) error {
 	}
 
 	if len(hosts) == 0 {
-		return fmt.Errorf("no hosts found in subfinder output")
+		return nil, fmt.Errorf("no hosts found in subfinder output")
 	}
 
-	return os.WriteFile(hostsFile, []byte(strings.Join(hosts, "\n")+"\n"), 0644)
+	return hosts, nil
 }
 
 // extractJSONField extracts a string value for a given key from a JSON line.
-// Lightweight extraction to avoid importing encoding/json for a simple case.
 func extractJSONField(jsonLine, key string) string {
 	search := fmt.Sprintf(`"%s":"`, key)
 	idx := strings.Index(jsonLine, search)
 	if idx == -1 {
-		// try with space after colon
 		search = fmt.Sprintf(`"%s": "`, key)
 		idx = strings.Index(jsonLine, search)
 		if idx == -1 {

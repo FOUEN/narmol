@@ -2,11 +2,11 @@ go 1.24.2
 
 use (
 	.
-	./dnsx
-	./gau
-	./httpx
-	./katana
-	./nuclei
-	./subfinder
-	./wappalyzergo
+	./tools/dnsx
+	./tools/gau
+	./tools/httpx
+	./tools/katana
+	./tools/nuclei
+	./tools/subfinder
+	./tools/wappalyzergo
 )

@@ -1,6 +1,10 @@
 package workflows
 
-import "fmt"
+import (
+	"fmt"
+
+	"narmol/scope"
+)
 
 // Workflow defines the interface that all narmol workflows must implement.
 type Workflow interface {
@@ -8,8 +12,9 @@ type Workflow interface {
 	Name() string
 	// Description returns a short description of what the workflow does.
 	Description() string
-	// Run executes the workflow for the given domain, writing JSON output to outputDir.
-	Run(domain string, outputDir string) error
+	// Run executes the workflow for the given domain, enforcing scope rules,
+	// and writing JSON output to outputDir.
+	Run(domain string, outputDir string, s *scope.Scope) error
 }
 
 // registry holds all registered workflows.
