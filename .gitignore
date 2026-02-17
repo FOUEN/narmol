@@ -1,6 +1,8 @@
 # Compiled binary
 narmol
-./test
+
+# Test/output directory
+test/
 
 # Go build artifacts
 *.exe

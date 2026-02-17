@@ -206,15 +206,22 @@ func (w *ActiveWorkflow) Run(domain string, s *scope.Scope, opts workflows.Outpu
 		return fmt.Errorf("failed to read active results: %w", err)
 	}
 
+	// Parse httpx JSONL and keep only essential fields for the active workflow.
+	// Other workflows (tech, vuln, etc.) will provide deeper detail.
 	var activeURLs []string
+	var cleanLines []string
+
 	for _, line := range strings.Split(string(activeData), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		url := extractJSONField(line, "url")
-		if url != "" {
-			activeURLs = append(activeURLs, url)
+
+		clean, url := compactResult(line)
+		if url == "" {
+			continue
 		}
+		activeURLs = append(activeURLs, url)
+		cleanLines = append(cleanLines, clean)
 	}
 
 	// JSON file output
@@ -224,8 +231,8 @@ func (w *ActiveWorkflow) Run(domain string, s *scope.Scope, opts workflows.Outpu
 			return fmt.Errorf("failed to open JSON output file %s: %w", opts.JSONFile, err)
 		}
 		defer f.Close()
-		if _, err := f.Write(activeData); err != nil {
-			return fmt.Errorf("failed to write JSON output to %s: %w", opts.JSONFile, err)
+		for _, cl := range cleanLines {
+			fmt.Fprintln(f, cl)
 		}
 		fmt.Printf("[+] JSON results appended to: %s\n", opts.JSONFile)
 	}
@@ -258,19 +265,59 @@ func (w *ActiveWorkflow) Run(domain string, s *scope.Scope, opts workflows.Outpu
 	return nil
 }
 
-// extractJSONField extracts a string value for a given key from a JSON line.
-func extractJSONField(jsonLine, key string) string {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(jsonLine), &m); err != nil {
-		return ""
+// activeResult contains only the essential fields for the active workflow.
+// Other workflows (tech, vuln, recon) will provide deeper detail.
+type activeResult struct {
+	URL        string   `json:"url"`
+	Input      string   `json:"input"`
+	Host       string   `json:"host"`
+	Port       string   `json:"port,omitempty"`
+	Scheme     string   `json:"scheme"`
+	StatusCode int      `json:"status_code"`
+	Title      string   `json:"title,omitempty"`
+	Webserver  string   `json:"webserver,omitempty"`
+	Tech       []string `json:"tech,omitempty"`
+	CDN        bool     `json:"cdn,omitempty"`
+	CDNName    string   `json:"cdn_name,omitempty"`
+}
+
+// compactResult parses a full httpx JSON line and returns a compact JSON string
+// with only the fields relevant for the active workflow, plus the URL.
+func compactResult(jsonLine string) (string, string) {
+	var full map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(jsonLine), &full); err != nil {
+		return "", ""
 	}
-	raw, ok := m[key]
-	if !ok {
-		return ""
+
+	r := activeResult{}
+	jsonGetString(full, "url", &r.URL)
+	jsonGetString(full, "input", &r.Input)
+	jsonGetString(full, "host", &r.Host)
+	jsonGetString(full, "port", &r.Port)
+	jsonGetString(full, "scheme", &r.Scheme)
+	jsonGetString(full, "title", &r.Title)
+	jsonGetString(full, "webserver", &r.Webserver)
+	jsonGetString(full, "cdn_name", &r.CDNName)
+
+	if raw, ok := full["status_code"]; ok {
+		json.Unmarshal(raw, &r.StatusCode)
 	}
-	var val string
-	if err := json.Unmarshal(raw, &val); err != nil {
-		return ""
+	if raw, ok := full["cdn"]; ok {
+		json.Unmarshal(raw, &r.CDN)
 	}
-	return val
+	if raw, ok := full["tech"]; ok {
+		json.Unmarshal(raw, &r.Tech)
+	}
+
+	out, err := json.Marshal(r)
+	if err != nil {
+		return "", ""
+	}
+	return string(out), r.URL
+}
+
+func jsonGetString(m map[string]json.RawMessage, key string, dst *string) {
+	if raw, ok := m[key]; ok {
+		json.Unmarshal(raw, dst)
+	}
 }
