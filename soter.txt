@@ -1,0 +1,6 @@
+https://mail.soterctf.com
+https://api.soterctf.com
+https://beyond.soterctf.com
+https://www.soterctf.com
+https://palcam.soterctf.com
+https://demo.soterctf.com

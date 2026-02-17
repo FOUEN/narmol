@@ -2,16 +2,22 @@ package active
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 
 	"narmol/scope"
 	"narmol/workflows"
 
 	"github.com/projectdiscovery/goflags"
 	httpx_runner "github.com/projectdiscovery/httpx/runner"
+	"github.com/projectdiscovery/subfinder/v2/pkg/resolve"
 	subfinder_runner "github.com/projectdiscovery/subfinder/v2/pkg/runner"
 )
 
@@ -20,7 +26,8 @@ func init() {
 }
 
 // ActiveWorkflow finds all subdomains for a domain and probes which ones are active.
-// All outputs are in JSON format. Results are filtered by scope.
+// Subfinder and httpx run concurrently: as subdomains are discovered they are
+// immediately streamed to httpx for probing, eliminating the wait between steps.
 type ActiveWorkflow struct{}
 
 func (w *ActiveWorkflow) Name() string {
@@ -28,143 +35,179 @@ func (w *ActiveWorkflow) Name() string {
 }
 
 func (w *ActiveWorkflow) Description() string {
-	return "Find all subdomains and check which are active (alive). Output: JSON."
+	return "Find all subdomains and check which are active (alive). Runs subfinder->httpx as a concurrent pipeline."
 }
 
 func (w *ActiveWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOptions) error {
-	// Verify scope before doing anything else
+	// Pre-checks
 	if !s.IsInScope(domain) {
 		return fmt.Errorf("domain %s is not in scope", domain)
 	}
-
-	// Verify wildcard scope for subdomain enumeration
 	if !s.HasWildcard(domain) {
 		return fmt.Errorf("active workflow requires a wildcard scope (*.%s) to invoke subdomain enumeration", domain)
 	}
 
-	// Create a temporary directory for intermediate results
+	// Temp directory for the FIFO and httpx output
 	tmpDir, err := os.MkdirTemp("", "narmol-active-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	subdomainsFile := filepath.Join(tmpDir, "subdomains.json")
-	hostsFile := filepath.Join(tmpDir, "hosts.txt")
+	// Create a named pipe (FIFO)
+	// Subfinder writes in-scope hosts here; httpx reads from it in stream mode.
+	fifoPath := filepath.Join(tmpDir, "pipeline.fifo")
+	if err := syscall.Mkfifo(fifoPath, 0600); err != nil {
+		return fmt.Errorf("failed to create FIFO: %w", err)
+	}
+
 	activeFile := filepath.Join(tmpDir, "active.json")
 
-	// ──────────────────────────────────────────────
-	// Step 1: Subfinder — discover subdomains
-	// ──────────────────────────────────────────────
-	fmt.Println("[*] Step 1/3: Running subfinder to discover subdomains...")
+	// Counters for the summary line
+	var totalFound int64
+	var inScope int64
+	var excluded int64
 
-	sfOptions := &subfinder_runner.Options{
-		Domain:             goflags.StringSlice{domain},
-		JSON:               true,
-		OutputFile:         subdomainsFile,
-		Silent:             true,
-		All:                false,
-		Timeout:            30,
-		MaxEnumerationTime: 10,
-		Threads:            10,
-		DisableUpdateCheck: true,
-		Output:             os.Stdout,
-		ProviderConfig:     "", // use default
+	// Goroutine: httpx (consumer)
+	// httpx opens the FIFO for reading in Stream mode. It blocks until the
+	// writer (subfinder goroutine) also opens the FIFO.
+	var httpxErr error
+	var httpxWg sync.WaitGroup
+	httpxWg.Add(1)
+
+	go func() {
+		defer httpxWg.Done()
+
+		hxOptions := &httpx_runner.Options{
+			InputFile:          fifoPath,
+			JSONOutput:         true,
+			Output:             activeFile,
+			Silent:             true,
+			Stream:             true,
+			Threads:            50,
+			Timeout:            10,
+			DisableUpdateCheck: true,
+			DisableStdin:       true,
+			NoColor:            true,
+			FollowRedirects:    true,
+			MaxRedirects:       10,
+			RateLimit:          150,
+			Retries:            0,
+			HostMaxErrors:      30,
+			RandomAgent:        true,
+		}
+
+		if err := hxOptions.ValidateOptions(); err != nil {
+			httpxErr = fmt.Errorf("httpx options validation failed: %w", err)
+			if f, openErr := os.Open(fifoPath); openErr == nil {
+				f.Close()
+			}
+			return
+		}
+
+		hxRunner, err := httpx_runner.New(hxOptions)
+		if err != nil {
+			httpxErr = fmt.Errorf("could not create httpx runner: %w", err)
+			if f, openErr := os.Open(fifoPath); openErr == nil {
+				f.Close()
+			}
+			return
+		}
+
+		hxRunner.RunEnumeration()
+		hxRunner.Close()
+	}()
+
+	// Goroutine: subfinder (producer)
+	// Opens the FIFO for writing and pushes every in-scope subdomain through it.
+	fmt.Println("[*] Pipeline started: subfinder -> scope filter -> httpx (concurrent)")
+
+	var subfinderErr error
+	var sfWg sync.WaitGroup
+	sfWg.Add(1)
+
+	go func() {
+		defer sfWg.Done()
+
+		// Open the write end of the FIFO (blocks until httpx opens the read end)
+		fifoWriter, err := os.OpenFile(fifoPath, os.O_WRONLY, os.ModeNamedPipe)
+		if err != nil {
+			subfinderErr = fmt.Errorf("failed to open FIFO for writing: %w", err)
+			return
+		}
+		defer fifoWriter.Close()
+
+		sfOptions := &subfinder_runner.Options{
+			Domain:             goflags.StringSlice{domain},
+			Silent:             true,
+			All:                false,
+			Timeout:            30,
+			MaxEnumerationTime: 10,
+			Threads:            10,
+			DisableUpdateCheck: true,
+			Output:             io.Discard,
+			ProviderConfig:     "",
+			ResultCallback: func(result *resolve.HostEntry) {
+				atomic.AddInt64(&totalFound, 1)
+				host := strings.TrimSpace(result.Host)
+				if host == "" {
+					return
+				}
+				if !s.IsInScope(host) {
+					atomic.AddInt64(&excluded, 1)
+					return
+				}
+				atomic.AddInt64(&inScope, 1)
+				fmt.Fprintln(fifoWriter, host)
+			},
+		}
+
+		sfRunner, err := subfinder_runner.NewRunner(sfOptions)
+		if err != nil {
+			subfinderErr = fmt.Errorf("could not create subfinder runner: %w", err)
+			return
+		}
+
+		if err := sfRunner.RunEnumerationWithCtx(context.Background()); err != nil {
+			subfinderErr = fmt.Errorf("subfinder enumeration failed: %w", err)
+			return
+		}
+	}()
+
+	// Wait for subfinder to finish (closes the FIFO write end -> EOF for httpx)
+	sfWg.Wait()
+	// Then wait for httpx to drain remaining targets
+	httpxWg.Wait()
+
+	// Error handling
+	if subfinderErr != nil {
+		return subfinderErr
 	}
-	sfOptions.ConfigureOutput()
-
-	sfRunner, err := subfinder_runner.NewRunner(sfOptions)
-	if err != nil {
-		return fmt.Errorf("could not create subfinder runner: %w", err)
+	if httpxErr != nil {
+		return httpxErr
 	}
 
-	if err := sfRunner.RunEnumerationWithCtx(context.Background()); err != nil {
-		return fmt.Errorf("subfinder enumeration failed: %w", err)
-	}
+	fmt.Printf("[+] Subfinder found %d subdomains -- %d in scope, %d excluded\n",
+		atomic.LoadInt64(&totalFound), atomic.LoadInt64(&inScope), atomic.LoadInt64(&excluded))
 
-	// Verify output
-	info, err := os.Stat(subdomainsFile)
-	if err != nil || info.Size() == 0 {
-		return fmt.Errorf("subfinder produced no results for domain: %s", domain)
-	}
-	fmt.Printf("[+] Subdomains saved to temp: %s\n", subdomainsFile)
-
-	// ──────────────────────────────────────────────
-	// Step 2: Scope filtering
-	// ──────────────────────────────────────────────
-	fmt.Println("[*] Step 2/3: Filtering subdomains by scope...")
-
-	hosts, err := extractHostsFromSubfinderJSON(subdomainsFile)
-	if err != nil {
-		return fmt.Errorf("could not extract hosts from subfinder output: %w", err)
-	}
-
-	originalCount := len(hosts)
-	hosts = s.FilterHosts(hosts)
-	filteredOut := originalCount - len(hosts)
-
-	fmt.Printf("[+] Scope filter: %d in scope, %d excluded\n", len(hosts), filteredOut)
-
-	if len(hosts) == 0 {
+	if atomic.LoadInt64(&inScope) == 0 {
 		return fmt.Errorf("no subdomains remaining after scope filtering")
 	}
 
-	// Write filtered hosts for httpx
-	if err := os.WriteFile(hostsFile, []byte(strings.Join(hosts, "\n")+"\n"), 0644); err != nil {
-		return fmt.Errorf("could not write hosts file: %w", err)
-	}
-
-	// ──────────────────────────────────────────────
-	// Step 3: Httpx — probe active subdomains
-	// ──────────────────────────────────────────────
-	fmt.Println("[*] Step 3/3: Running httpx to find active subdomains...")
-
-	hxOptions := &httpx_runner.Options{
-		InputFile:          hostsFile,
-		JSONOutput:         true,
-		Output:             activeFile,
-		Silent:             true,
-		Threads:            50,
-		Timeout:            10,
-		DisableUpdateCheck: true,
-		DisableStdin:       true,
-		NoColor:            true,
-		FollowRedirects:    true,
-		MaxRedirects:       10,
-		RateLimit:          150,
-		Retries:            0,
-		HostMaxErrors:      30,
-		RandomAgent:        true,
-		// Method:			 "GET", // Default is GET
-	}
-
-	if err := hxOptions.ValidateOptions(); err != nil {
-		return fmt.Errorf("httpx options validation failed: %w", err)
-	}
-
-	hxRunner, err := httpx_runner.New(hxOptions)
-	if err != nil {
-		return fmt.Errorf("could not create httpx runner: %w", err)
-	}
-
-	hxRunner.RunEnumeration()
-	hxRunner.Close()
-
-	// ──────────────────────────────────────────────
-	// Step 4: Process Output
-	// ──────────────────────────────────────────────
+	// Process output
 	fmt.Println("[*] Processing results...")
 
-	// Read active.json results
 	activeData, err := os.ReadFile(activeFile)
 	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("[!] No active hosts found.")
+			return nil
+		}
 		return fmt.Errorf("failed to read active results: %w", err)
 	}
 
-	// Parse JSON lines to extract URLs for text output if needed
 	var activeURLs []string
-	lines := strings.Split(string(activeData), "\n")
-	for _, line := range lines {
+	for _, line := range strings.Split(string(activeData), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
@@ -174,98 +217,60 @@ func (w *ActiveWorkflow) Run(domain string, s *scope.Scope, opts workflows.Outpu
 		}
 	}
 
-	// Output logic based on options
-	// 1. JSON File Output
+	// JSON file output
 	if opts.JSONFile != "" {
 		f, err := os.OpenFile(opts.JSONFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			return fmt.Errorf("failed to open JSON output file %s: %w", opts.JSONFile, err)
 		}
 		defer f.Close()
-
 		if _, err := f.Write(activeData); err != nil {
 			return fmt.Errorf("failed to write JSON output to %s: %w", opts.JSONFile, err)
 		}
-		// Add newline if needed between appends? JSON lines usually need newlines. activeData often has trailing newline.
-		// If not, we might want to ensure it.
-		// Assuming activeData from httpx JSON output has newlines.
 		fmt.Printf("[+] JSON results appended to: %s\n", opts.JSONFile)
 	}
 
-	// 2. Text File Output
+	// Text file output
 	if opts.TextFile != "" {
 		content := strings.Join(activeURLs, "\n")
 		if len(activeURLs) > 0 {
 			content += "\n"
 		}
-
 		f, err := os.OpenFile(opts.TextFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			return fmt.Errorf("failed to open text output file %s: %w", opts.TextFile, err)
 		}
 		defer f.Close()
-
 		if _, err := f.WriteString(content); err != nil {
 			return fmt.Errorf("failed to write text output to %s: %w", opts.TextFile, err)
 		}
 		fmt.Printf("[+] Text results appended to: %s\n", opts.TextFile)
 	}
 
-	// 3. Stdout Output (Default if no files specified, OR maybe always? User said "default normal text... if -o specified then that file". Usually exclusive or implies stdout if NO file)
-	// User said: "por default sean en texto normal sino se pone nada" (default text normal if nothing put)
-	// "si se pone -o se pone en ese archivo" (if -o put, put in that file)
-	// This implies: if NO output options, output to stdout.
+	// Stdout (default when no file output requested)
 	if opts.TextFile == "" && opts.JSONFile == "" {
 		for _, url := range activeURLs {
 			fmt.Println(url)
 		}
 	}
 
-	fmt.Println("[✓] Workflow 'active' completed successfully.")
+	fmt.Printf("[+] Workflow 'active' completed -- %d active hosts found.\n", len(activeURLs))
 	return nil
-}
-
-// extractHostsFromSubfinderJSON reads subfinder JSONL output and extracts host fields.
-func extractHostsFromSubfinderJSON(jsonlFile string) ([]string, error) {
-	data, err := os.ReadFile(jsonlFile)
-	if err != nil {
-		return nil, err
-	}
-
-	var hosts []string
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		host := extractJSONField(line, "host")
-		if host != "" {
-			hosts = append(hosts, host)
-		}
-	}
-
-	if len(hosts) == 0 {
-		return nil, fmt.Errorf("no hosts found in subfinder output")
-	}
-
-	return hosts, nil
 }
 
 // extractJSONField extracts a string value for a given key from a JSON line.
 func extractJSONField(jsonLine, key string) string {
-	search := fmt.Sprintf(`"%s":"`, key)
-	idx := strings.Index(jsonLine, search)
-	if idx == -1 {
-		search = fmt.Sprintf(`"%s": "`, key)
-		idx = strings.Index(jsonLine, search)
-		if idx == -1 {
-			return ""
-		}
-	}
-	start := idx + len(search)
-	end := strings.Index(jsonLine[start:], `"`)
-	if end == -1 {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(jsonLine), &m); err != nil {
 		return ""
 	}
-	return jsonLine[start : start+end]
+	raw, ok := m[key]
+	if !ok {
+		return ""
+	}
+	var val string
+	if err := json.Unmarshal(raw, &val); err != nil {
+		return ""
+	}
+	return val
 }
