@@ -1,4 +1,4 @@
-package nuclei_cmd
+package nuclei
 
 import (
 	"bufio"
@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/projectdiscovery/gologger"
-	_pdcp "github.com/projectdiscovery/nuclei/v3/pkg/pdcp"
+	_pdcp "github.com/projectdiscovery/nuclei/v3/internal/pdcp"
 	"github.com/projectdiscovery/utils/auth/pdcp"
 	"github.com/projectdiscovery/utils/env"
 	_ "github.com/projectdiscovery/utils/pprof"
@@ -25,7 +25,7 @@ import (
 	"github.com/projectdiscovery/goflags"
 	"github.com/projectdiscovery/gologger/levels"
 	"github.com/projectdiscovery/interactsh/pkg/client"
-	"github.com/projectdiscovery/nuclei/v3/pkg/runner"
+	"github.com/projectdiscovery/nuclei/v3/internal/runner"
 	"github.com/projectdiscovery/nuclei/v3/pkg/catalog/config"
 	"github.com/projectdiscovery/nuclei/v3/pkg/input/provider"
 	"github.com/projectdiscovery/nuclei/v3/pkg/installer"
@@ -196,7 +196,7 @@ func Main() {
 
 	// Setup filename for graceful exits
 	resumeFileName := types.DefaultResumeFilePath()
-	if options.Resume == "" {
+	if options.Resume != "" {
 		resumeFileName = options.Resume
 	}
 	c := make(chan os.Signal, 1)

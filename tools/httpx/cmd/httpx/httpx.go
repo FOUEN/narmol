@@ -1,4 +1,4 @@
-package httpx_cmd
+package httpx
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 
 	"github.com/logrusorgru/aurora"
 	"github.com/projectdiscovery/gologger"
-	"github.com/projectdiscovery/httpx/pkg/pdcp"
+	"github.com/projectdiscovery/httpx/internal/pdcp"
 	"github.com/projectdiscovery/httpx/runner"
 	pdcpauth "github.com/projectdiscovery/utils/auth/pdcp"
 	_ "github.com/projectdiscovery/utils/pprof"
@@ -73,21 +73,26 @@ func Main() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	go func() {
-		for range c {
-			gologger.Info().Msgf("CTRL+C pressed: Exiting\n")
-			httpxRunner.Close()
-			if options.ShouldSaveResume() {
-				gologger.Info().Msgf("Creating resume file: %s\n", runner.DefaultResumeFile)
-				err := httpxRunner.SaveResumeConfig()
-				if err != nil {
-					gologger.Error().Msgf("Couldn't create resume file: %s\n", err)
-				}
-			}
-			os.Exit(1)
-		}
+		// First Ctrl+C: stop dispatching, let in-flight requests finish
+		<-c
+		gologger.Info().Msgf("CTRL+C pressed: Exiting\n")
+		httpxRunner.Interrupt()
+		// Second Ctrl+C: force exit
+		<-c
+		gologger.Info().Msgf("Forcing exit\n")
+		os.Exit(1)
 	}()
 
 	httpxRunner.RunEnumeration()
+
+	if httpxRunner.IsInterrupted() && options.ShouldSaveResume() {
+		gologger.Info().Msgf("Creating resume file: %s\n", runner.DefaultResumeFile)
+		err := httpxRunner.SaveResumeConfig()
+		if err != nil {
+			gologger.Error().Msgf("Couldn't create resume file: %s\n", err)
+		}
+	}
+
 	httpxRunner.Close()
 }
 

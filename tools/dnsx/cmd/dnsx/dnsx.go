@@ -1,10 +1,10 @@
-package dnsx_cmd
+package dnsx
 
 import (
 	"os"
 	"os/signal"
 
-	"github.com/projectdiscovery/dnsx/pkg/runner"
+	"github.com/projectdiscovery/dnsx/internal/runner"
 	"github.com/projectdiscovery/gologger"
 )
 

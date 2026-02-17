@@ -27,53 +27,68 @@ type Scope struct {
 	excludes []rule
 }
 
-// LoadFromFile parses a scope file and returns a Scope instance.
-// Returns an error if the file cannot be read or contains no valid rules.
-func LoadFromFile(path string) (*Scope, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("could not open scope file: %w", err)
-	}
-	defer f.Close()
-
+// Load parses a scope definition which can be a file path or a direct string (comma-separated rules).
+// Returns a Scope instance.
+func Load(input string) (*Scope, error) {
 	s := &Scope{}
-	scanner := bufio.NewScanner(f)
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	// Check if input is a file
+	info, err := os.Stat(input)
+	isFile := err == nil && !info.IsDir()
 
-		// Skip empty lines and comments
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+	if isFile {
+		f, err := os.Open(input)
+		if err != nil {
+			return nil, fmt.Errorf("could not open scope file: %w", err)
 		}
+		defer f.Close()
 
-		// Strip inline comments
-		if idx := strings.Index(line, " #"); idx != -1 {
-			line = strings.TrimSpace(line[:idx])
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			processLine(s, scanner.Text())
 		}
-
-		if strings.HasPrefix(line, "-") {
-			s.excludes = append(s.excludes, rule{
-				pattern: strings.TrimPrefix(line, "-"),
-				exclude: true,
-			})
-		} else {
-			s.includes = append(s.includes, rule{
-				pattern: line,
-				exclude: false,
-			})
+		if err := scanner.Err(); err != nil {
+			return nil, fmt.Errorf("error reading scope file: %w", err)
 		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading scope file: %w", err)
+	} else {
+		// Treat as direct string (comma-separated if needed)
+		parts := strings.Split(input, ",")
+		for _, part := range parts {
+			processLine(s, part)
+		}
 	}
 
 	if len(s.includes) == 0 {
-		return nil, fmt.Errorf("scope file contains no inclusion rules")
+		return nil, fmt.Errorf("scope contains no inclusion rules")
 	}
 
 	return s, nil
+}
+
+func processLine(s *Scope, line string) {
+	line = strings.TrimSpace(line)
+
+	// Skip empty lines and comments
+	if line == "" || strings.HasPrefix(line, "#") {
+		return
+	}
+
+	// Strip inline comments
+	if idx := strings.Index(line, " #"); idx != -1 {
+		line = strings.TrimSpace(line[:idx])
+	}
+
+	if strings.HasPrefix(line, "-") {
+		s.excludes = append(s.excludes, rule{
+			pattern: strings.TrimPrefix(line, "-"),
+			exclude: true,
+		})
+	} else {
+		s.includes = append(s.includes, rule{
+			pattern: line,
+			exclude: false,
+		})
+	}
 }
 
 // IsInScope checks whether a given target (domain/host) is within scope.
@@ -137,10 +152,7 @@ func (s *Scope) Domains() []string {
 	seen := map[string]bool{}
 	var domains []string
 	for _, r := range s.includes {
-		domain := r.pattern
-		if strings.HasPrefix(domain, "*.") {
-			domain = domain[2:]
-		}
+		domain := strings.TrimPrefix(r.pattern, "*.")
 		domain = strings.ToLower(domain)
 		if !seen[domain] {
 			seen[domain] = true
@@ -165,6 +177,32 @@ func (s *Scope) String() string {
 		}
 	}
 	return sb.String()
+}
+
+// HasWildcard checks if the scope includes a wildcard rule for the given domain.
+// Used to prevent subdomain enumeration on single-host targets.
+func (s *Scope) HasWildcard(target string) bool {
+	target = strings.ToLower(strings.TrimSpace(target))
+
+	// Direct check: if the target itself is a wildcard pattern in includes?
+	// No, the input target is "example.com". We check if our rules have "*.example.com"
+
+	// Better logic: iterate includes, check if any include starts with "*." AND matches the target as base.
+	for _, r := range s.includes {
+		if strings.HasPrefix(r.pattern, "*.") {
+			baseDomain := r.pattern[2:] // remove "*."
+			// If target IS the base domain (example.com), then yes, we have a wildcard for it.
+			if target == baseDomain {
+				return true
+			}
+			// If target is a subdomain (sub.example.com), and we have *.example.com rule,
+			// then yes, it's covered by wildcard.
+			if strings.HasSuffix(target, "."+baseDomain) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // matchPattern checks if a target matches a pattern.

@@ -6,15 +6,20 @@ import (
 	"narmol/scope"
 )
 
+// OutputOptions defines how workflow results should be output.
+type OutputOptions struct {
+	TextFile string
+	JSONFile string
+}
+
 // Workflow defines the interface that all narmol workflows must implement.
 type Workflow interface {
 	// Name returns the workflow identifier.
 	Name() string
 	// Description returns a short description of what the workflow does.
 	Description() string
-	// Run executes the workflow for the given domain, enforcing scope rules,
-	// and writing JSON output to outputDir.
-	Run(domain string, outputDir string, s *scope.Scope) error
+	// Run executes the workflow for the given domain, enforcing scope rules.
+	Run(domain string, s *scope.Scope, opts OutputOptions) error
 }
 
 // registry holds all registered workflows.

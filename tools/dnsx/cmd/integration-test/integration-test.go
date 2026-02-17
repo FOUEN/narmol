@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/logrusorgru/aurora"
-	"github.com/projectdiscovery/dnsx/pkg/testutils"
+	"github.com/projectdiscovery/dnsx/internal/testutils"
 )
 
 var (

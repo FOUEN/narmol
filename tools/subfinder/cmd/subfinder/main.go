@@ -1,4 +1,4 @@
-package subfinder_cmd
+package subfinder
 
 import (
 	"github.com/projectdiscovery/subfinder/v2/pkg/runner"

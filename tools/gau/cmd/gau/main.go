@@ -1,4 +1,4 @@
-package gau_cmd
+package gau
 
 import (
 	"bufio"

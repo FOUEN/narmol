@@ -11,7 +11,7 @@ import (
 	"github.com/logrusorgru/aurora"
 	"github.com/pkg/errors"
 
-	"github.com/projectdiscovery/httpx/pkg/testutils"
+	"github.com/projectdiscovery/httpx/internal/testutils"
 )
 
 var (

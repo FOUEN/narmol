@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/julienschmidt/httprouter"
-	"github.com/projectdiscovery/httpx/pkg/testutils"
+	"github.com/projectdiscovery/httpx/internal/testutils"
 	fileutil "github.com/projectdiscovery/utils/file"
 )
 

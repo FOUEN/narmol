@@ -18,7 +18,7 @@ func createTempScopeFile(t *testing.T, content string) string {
 
 func TestWildcardInclusion(t *testing.T) {
 	path := createTempScopeFile(t, "*.example.com\n")
-	s, err := LoadFromFile(path)
+	s, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestWildcardInclusion(t *testing.T) {
 
 func TestExactInclusion(t *testing.T) {
 	path := createTempScopeFile(t, "api.example.com\n")
-	s, err := LoadFromFile(path)
+	s, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestExclusions(t *testing.T) {
 -*.staging.example.com
 `
 	path := createTempScopeFile(t, content)
-	s, err := LoadFromFile(path)
+	s, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,11 +83,11 @@ func TestExclusions(t *testing.T) {
 	}{
 		{"www.example.com", true},
 		{"api.example.com", true},
-		{"admin.example.com", false},        // excluded explicitly
-		{"staging.example.com", false},       // excluded by wildcard
-		{"dev.staging.example.com", false},   // excluded by wildcard
-		{"a.b.staging.example.com", false},   // excluded by deep wildcard
-		{"example.com", true},                // root not excluded
+		{"admin.example.com", false},       // excluded explicitly
+		{"staging.example.com", false},     // excluded by wildcard
+		{"dev.staging.example.com", false}, // excluded by wildcard
+		{"a.b.staging.example.com", false}, // excluded by deep wildcard
+		{"example.com", true},              // root not excluded
 	}
 
 	for _, tt := range tests {
@@ -99,7 +99,7 @@ func TestExclusions(t *testing.T) {
 
 func TestURLStripping(t *testing.T) {
 	path := createTempScopeFile(t, "*.example.com\n")
-	s, err := LoadFromFile(path)
+	s, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestFilterHosts(t *testing.T) {
 -admin.example.com
 `
 	path := createTempScopeFile(t, content)
-	s, err := LoadFromFile(path)
+	s, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestCommentsAndEmptyLines(t *testing.T) {
 -admin.example.com
 `
 	path := createTempScopeFile(t, content)
-	s, err := LoadFromFile(path)
+	s, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestCommentsAndEmptyLines(t *testing.T) {
 
 func TestEmptyScopeFileError(t *testing.T) {
 	path := createTempScopeFile(t, "# only comments\n\n")
-	_, err := LoadFromFile(path)
+	_, err := Load(path)
 	if err == nil {
 		t.Error("expected error for scope file with no inclusion rules")
 	}
@@ -181,7 +181,7 @@ api.specific.org
 -*.dev.target.io
 `
 	path := createTempScopeFile(t, content)
-	s, err := LoadFromFile(path)
+	s, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,5 +203,34 @@ api.specific.org
 		if got := s.IsInScope(tt.target); got != tt.want {
 			t.Errorf("IsInScope(%q) = %v, want %v", tt.target, got, tt.want)
 		}
+	}
+}
+
+func TestLoadFromString(t *testing.T) {
+	// Test single domain
+	s, err := Load("example.com")
+	if err != nil {
+		t.Fatalf("failed to load from string: %v", err)
+	}
+	if !s.IsInScope("example.com") {
+		t.Error("expected example.com to be in scope")
+	}
+
+	// Test wildcard string
+	s2, err := Load("*.test.com")
+	if err != nil {
+		t.Fatalf("failed to load wildcard string: %v", err)
+	}
+	if !s2.IsInScope("sub.test.com") {
+		t.Error("expected sub.test.com to be in scope")
+	}
+
+	// Test comma separated
+	s3, err := Load("foo.com,bar.com")
+	if err != nil {
+		t.Fatalf("failed to load comma separated string: %v", err)
+	}
+	if !s3.IsInScope("foo.com") || !s3.IsInScope("bar.com") {
+		t.Error("expected foo.com and bar.com to be in scope")
 	}
 }

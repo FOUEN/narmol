@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/miekg/dns"
-	"github.com/projectdiscovery/dnsx/pkg/testutils"
+	"github.com/projectdiscovery/dnsx/internal/testutils"
 )
 
 var dnsTestcases = map[string]testutils.TestCase{

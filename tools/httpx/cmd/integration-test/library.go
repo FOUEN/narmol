@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/projectdiscovery/httpx/pkg/testutils"
+	"github.com/projectdiscovery/httpx/internal/testutils"
 	"github.com/projectdiscovery/httpx/runner"
 )
 
