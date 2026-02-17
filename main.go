@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -12,8 +13,12 @@ import (
 	nuclei_cmd "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"
 	subfinder_cmd "github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
 	gau_cmd "github.com/lc/gau/v2/cmd/gau"
+
+	// Workflows
+	"narmol/workflows"
+	_ "narmol/workflows/active" // auto-register active workflow
 )
-//comit
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -21,10 +26,13 @@ func main() {
 	}
 
 	toolName := os.Args[1]
-	// Remove the first argument (narmol) and the tool name from args for the sub-tool
-	// But tools usually expect os.Args[0] to be the program name.
-	// We will construct a synthetic os.Args.
-	
+
+	// Handle "workflow" subcommand
+	if toolName == "workflow" {
+		runWorkflow(os.Args[2:])
+		return
+	}
+
 	// Shift args: [narmol, tool, arg1, arg2...] -> [tool, arg1, arg2...]
 	subArgs := append([]string{toolName}, os.Args[2:]...)
 	os.Args = subArgs
@@ -45,29 +53,69 @@ func main() {
 		subfinder_cmd.Main()
 	case "gau":
 		gau_cmd.Main()
-	case "scan":
-		runScanWorkflow(os.Args)
 	default:
-		// Reset args to print usage correctly (though we printed generic usage above)
 		fmt.Printf("Unknown tool: %s\n", toolName)
 		printUsage()
 	}
 }
 
-func runScanWorkflow(args []string) {
-	fmt.Println("Scan workflow not yet implemented. Use specific tools for now.")
-	// Placeholder for future workflow logic
+func runWorkflow(args []string) {
+	if len(args) == 0 {
+		printWorkflows()
+		return
+	}
+
+	name := args[0]
+
+	// Parse workflow flags
+	fs := flag.NewFlagSet("workflow", flag.ExitOnError)
+	domain := fs.String("d", "", "Target domain")
+	outputDir := fs.String("o", "./output", "Output directory")
+	fs.Parse(args[1:])
+
+	if *domain == "" {
+		fmt.Println("Error: -d (domain) is required")
+		fmt.Printf("Usage: narmol workflow %s -d <domain> [-o <output_dir>]\n", name)
+		os.Exit(1)
+	}
+
+	w, err := workflows.Get(name)
+	if err != nil {
+		fmt.Printf("Error: %s\n", err)
+		printWorkflows()
+		os.Exit(1)
+	}
+
+	fmt.Printf("[*] Running workflow '%s' for domain: %s\n", name, *domain)
+	if err := w.Run(*domain, *outputDir); err != nil {
+		fmt.Printf("[!] Workflow failed: %s\n", err)
+		os.Exit(1)
+	}
+}
+
+func printWorkflows() {
+	fmt.Println("Available workflows:")
+	for _, w := range workflows.List() {
+		fmt.Printf("  - %-12s %s\n", w.Name(), w.Description())
+	}
+	fmt.Println()
+	fmt.Println("Usage: narmol workflow <name> -d <domain> [-o <output_dir>]")
 }
 
 func printUsage() {
 	fmt.Println("Narmol Wrapper")
-	fmt.Println("Usage: narmol <tool> [args...]")
+	fmt.Println("Usage: narmol <command> [args...]")
+	fmt.Println()
 	fmt.Println("Tools:")
-	fmt.Println("  - nuclei")
-	fmt.Println("  - httpx")
-	fmt.Println("  - katana")
-	fmt.Println("  - dnsx")
-	fmt.Println("  - subfinder")
-	fmt.Println("  - gau")
-	fmt.Println("  - scan (workflow)")
+	fmt.Println("  nuclei       Run nuclei scanner")
+	fmt.Println("  httpx        Run httpx prober")
+	fmt.Println("  katana       Run katana crawler")
+	fmt.Println("  dnsx         Run dnsx resolver")
+	fmt.Println("  subfinder    Run subfinder enumerator")
+	fmt.Println("  gau          Run gau URL fetcher")
+	fmt.Println()
+	fmt.Println("Workflows:")
+	fmt.Println("  workflow     Run a predefined workflow")
+	fmt.Println()
+	fmt.Println("Run 'narmol workflow' to see available workflows.")
 }

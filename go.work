@@ -8,4 +8,5 @@ use (
 	./katana
 	./nuclei
 	./subfinder
+	./wappalyzergo
 )
