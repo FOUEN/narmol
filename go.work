@@ -1,7 +1,8 @@
-go 1.24.2
+go 1.24.4
 
 use (
 	.
+	./tools/amass
 	./tools/dnsx
 	./tools/gau
 	./tools/httpx

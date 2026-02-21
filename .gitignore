@@ -1,6 +1,9 @@
 # Compiled binary
 narmol
 
+# IDE
+.vscode/
+
 # Test/output directory
 test/
 

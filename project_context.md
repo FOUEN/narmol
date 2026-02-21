@@ -1,91 +1,399 @@
-# Narmol - Project Context & Architecture
+# Narmol — Contexto para edición de código
 
-This document provides a comprehensive overview of the **Narmol** project, its architecture, and the recent structural changes made to improve its robustness and usability.
-
----
-
-## 1. Project Overview
-**Narmol** is a Go-based wrapper and orchestrator for various security and reconnaissance tools (primarily from ProjectDiscovery and the broader community). It allows running complex workflows, managing dependencies locally, and enforcing scope constraints.
-
-### Core Goals:
-- **Orchestration**: Run tools like `subfinder`, `httpx`, and `nuclei` in a sequence (workflows).
-- **Scope Enforcement**: Ensure no targets outside of the predefined scope are touched.
-- **Dependency Management**: Maintain local copies of tools and keep them updated/patched.
-- **Flexible Output**: Support text, JSON, and terminal output.
+Este documento da contexto completo a un modelo de IA para editar código de narmol con confianza.
 
 ---
 
-## 2. Project Structure
-```text
-.
-├── go.mod / go.sum          # Go module definitions
-├── go.work                  # Go Workspace (manages local /tools/ as modules)
-├── main.go                  # Entry point (CLI parsing, Command dispatch)
-├── scope/                   # Scope parsing and enforcement logic
-│   ├── scope.go
-│   └── scope_test.go
-├── workflows/               # Workflow registry and interface
-│   ├── registry.go          # Workflow interface and registration
-│   └── active/              # 'active' workflow implementation
-│       └── active.go
-└── tools/                   # Local tool repositories (cloned/patched)
-    ├── dnsx, httpx, nuclei, subfinder, katana, gau, wappalyzergo...
+## 1. Qué es narmol
+
+Un binario Go que compila 8 herramientas de seguridad externas dentro de sí mismo (no las llama via exec.Command), les añade scope enforcement y permite ejecutar workflows que encadenan herramientas.
+
+---
+
+## 2. Reglas absolutas
+
+1. **NUNCA `exec.Command` para ejecutar una tool.** Las tools son repos clonados en `tools/`, parcheados para exponer `func Main()`, e importados como paquetes Go.
+2. **Go Workspace obligatorio.** Cada tool en `tools/` tiene su propio `go.mod`. El fichero `go.work` los une.
+3. **Patrón init() para registros.** Tools y workflows se registran en `init()` y se importan en `main.go` con `_`.
+4. **Module path = `github.com/FOUEN/narmol`.** Paquetes internos bajo `internal/`.
+5. **Build tags `bootstrap` / `!bootstrap`.** Ficheros que importan tools externas llevan `//go:build !bootstrap`.
+6. **Scope siempre filtra.** Todo workflow recibe `*scope.Scope` y filtra antes de tocar la red.
+7. **Output en modo append.** `os.O_APPEND|os.O_CREATE|os.O_WRONLY`.
+
+---
+
+## 3. Estructura del proyecto
+
+```
+narmol/
+├── main.go                     # Entrypoint
+├── go.mod                      # module github.com/FOUEN/narmol
+├── go.work                     # Go Workspace (. + 8 tools)
+├── README.md
+├── project_context.md          # ESTE FICHERO
+│
+├── internal/                   # Paquetes internos (no importables externamente)
+│   ├── cli/
+│   │   ├── cli.go              # Run() dispatcher: "workflow", "update", o tool passthrough
+│   │   ├── update.go           # RunUpdate() → updater.SelfUpdate()
+│   │   ├── usage.go            # PrintUsage()
+│   │   └── workflow.go         # RunWorkflow() — parsea flags -s, -o, -oj
+│   │
+│   ├── runner/
+│   │   ├── registry.go         # Tool struct, Register(), Get(), List()
+│   │   ├── tools.go            # [!bootstrap] init() registra 7 tools
+│   │   └── tools_bootstrap.go  # [bootstrap] stub vacío
+│   │
+│   ├── scope/
+│   │   └── scope.go            # Scope struct, Load(), IsInScope(), FilterHosts(), Domains()
+│   │
+│   ├── updater/
+│   │   ├── updater.go          # ToolSource, DefaultTools(), UpdateAll(), fetchOrClone()
+│   │   ├── patcher.go          # PatchTool(), PatchFile()
+│   │   └── selfupdate.go       # SelfUpdate(), resolveSourceDir(), rebuildAndReplace()
+│   │
+│   └── workflows/
+│       ├── registry.go         # Workflow interface, OutputOptions, Register(), Get(), List()
+│       └── active/
+│           ├── active.go           # [!bootstrap] ActiveWorkflow — subfinder→httpx via FIFO
+│           └── active_bootstrap.go # [bootstrap] stub vacío
+│
+└── tools/                      # Repos clonados y parcheados (gestionados por narmol update)
+    ├── amass/
+    ├── dnsx/
+    ├── gau/
+    ├── httpx/
+    ├── katana/
+    ├── nuclei/
+    ├── subfinder/
+    └── wappalyzergo/
 ```
 
 ---
 
-## 3. Key Components
+## 4. Sistema de build tags (bootstrap)
 
-### A. The `main.go` (The Brain)
-Handles three primary modes:
-1.  **Tool Passthrough**: Runs a specific tool with raw arguments (e.g., `narmol nuclei -t ...`). It imports the tool's `Main()` function directly.
-2.  **`update` Command**: Updates all local tools in `tools/` using Git (fetch/reset or clone). It then automatically **patches** the tools to make them importable as libraries.
-3.  **`workflow` Command**: Orchestrates a series of steps (e.g., `active` workflow). It parses `-s` (scope), `-o` (text output), and `-oj` (JSON output).
+`go install` no soporta `go.work`. Sin workspace, los imports de tools resuelven al upstream sin parchear y falla.
 
-### B. Scope Management (`/scope`)
-The scope determines what domains and subdomains are allowed.
-- **Rules**: Supports inclusion (default) and exclusion (prefix with `-`).
-- **Wildcards**: Supports `*.example.com` (covers the root and all subdomains).
-- **Parsing**: Can load rules from a file **or** directly from the CLI argument (comma-separated).
-- **Validation**: Enforces that enumeration workflows (like `active`) **must** have a wildcard scope to prevent accidental scanning of unrelated hosts.
+| Modo | Tag | Qué incluye | Uso |
+|---|---|---|---|
+| **Full** | ninguno | Todo: tools + workflows + updater | `go build .` desde source |
+| **Bootstrap** | `-tags bootstrap` | Solo CLI + updater (sin tools) | `go install -tags bootstrap github.com/FOUEN/narmol@latest` |
 
-### C. Workflows (`/workflows`)
-Workflows implement the `Workflow` interface:
+Ficheros con `//go:build !bootstrap`: `internal/runner/tools.go`, `internal/workflows/active/active.go`
+Ficheros con `//go:build bootstrap`: `internal/runner/tools_bootstrap.go`, `internal/workflows/active/active_bootstrap.go`
+
+Tras `go install -tags bootstrap`, ejecutar `narmol update` rebuilda el binario completo (sin tag bootstrap).
+
+---
+
+## 5. Código fuente — fichero por fichero
+
+### 5.1 `main.go`
+
 ```go
-type Workflow interface {
-    Name() string
-    Description() string
-    Run(domain string, s *scope.Scope, opts OutputOptions) error
+package main
+
+import (
+	"github.com/FOUEN/narmol/internal/cli"
+	_ "github.com/FOUEN/narmol/internal/runner"
+	_ "github.com/FOUEN/narmol/internal/workflows/active"
+)
+
+func main() { cli.Run() }
+```
+
+---
+
+### 5.2 `internal/cli/cli.go`
+
+```go
+package cli
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"github.com/FOUEN/narmol/internal/runner"
+)
+
+func Run() {
+	if len(os.Args) < 2 { PrintUsage(); return }
+	command := os.Args[1]
+	switch command {
+	case "workflow": RunWorkflow(os.Args[2:])
+	case "update":   RunUpdate()
+	default:         RunTool(command)
+	}
+}
+
+func RunTool(name string) {
+	os.Args = append([]string{name}, os.Args[2:]...)
+	tool := strings.TrimPrefix(name, "-")
+	t, err := runner.Get(tool)
+	if err != nil { fmt.Printf("Unknown command: %s\n", name); PrintUsage(); os.Exit(1) }
+	t.Main()
 }
 ```
-The **`active` workflow** is currently the primary implementation:
-1.  Verifies the domain is in scope and has a wildcard rule.
-2.  Runs `subfinder` to discover subdomains (in a temp directory).
-3.  Filters discovered subdomains against the global scope.
-4.  Runs `httpx` on the filtered list to find alive hosts.
-5.  Outputs results to Text, JSON, or Stdout as requested.
 
 ---
 
-## 4. Special Features
+### 5.3 `internal/cli/update.go`
 
-### The Patching System
-Since most tool CLI entry points are defined as `package main`, they cannot be imported in Go. The `narmol update` command fixes this by:
-- Modifying the tool's `main.go` to use `package <toolname>`.
-- Renaming `func main()` to `func Main()`.
-- Stripping conflicting test files (e.g., `nuclei` benchmark tests) that would break the build.
+```go
+package cli
 
-### Flexible Output Logic
-The output system is designed for both human readability and automation:
-- **Default**: Results go to Stdout for quick inspection.
-- **File Output**: Using `-o` or `-oj` creates files. If no domain is provided after the flag, it uses the workflow name (e.g., `active.txt`).
-- **Append Mode**: When running for multiple target domains in a single scope, the results are appended to the output files instead of overwriting, allowing for consolidated reports.
+import "github.com/FOUEN/narmol/internal/updater"
+
+func RunUpdate() { updater.SelfUpdate() }
+```
 
 ---
 
-## 5. Usage Lifecycle
-1.  **Initialize/Update**: `narmol update` (Ensures tools are present and patched).
-2.  **Build**: `go build .` (Compiles the orchestrator with tools inside).
-3.  **Run**:
-    - `narmol workflow active -s example.com,*.example.com` (Direct scope).
-    - `narmol workflow active -s scope.txt -o results.txt` (File-based scope and output).
+### 5.4 `internal/cli/usage.go`
+
+```go
+package cli
+
+import (
+	"fmt"
+	"github.com/FOUEN/narmol/internal/runner"
+)
+
+func PrintUsage() {
+	// Prints tool list + commands
+}
+```
+
+---
+
+### 5.5 `internal/cli/workflow.go`
+
+```go
+package cli
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"github.com/FOUEN/narmol/internal/scope"
+	"github.com/FOUEN/narmol/internal/workflows"
+)
+
+func RunWorkflow(args []string) {
+	// Parsea: name, -s scope, -o file, -oj file
+	// scope.Load(scopeFile)
+	// workflows.Get(name)
+	// Para cada s.Domains(): w.Run(domain, s, outputOpts)
+}
+
+type workflowFlags struct { scopeFile, textFile, jsonFile string }
+
+func parseWorkflowFlags(workflowName string, args []string) workflowFlags {
+	// Manual parsing. -o/-oj soportan valores opcionales (default: <workflow>.txt/.json)
+}
+```
+
+---
+
+### 5.6 `internal/runner/registry.go`
+
+```go
+package runner
+
+import "fmt"
+
+type Tool struct {
+	Name        string
+	Description string
+	Main        func()
+}
+
+var registry = map[string]Tool{}
+
+func Register(t Tool) { registry[t.Name] = t }
+func Get(name string) (Tool, error) { ... }
+func List() []Tool { ... }
+```
+
+---
+
+### 5.7 `internal/runner/tools.go` — `//go:build !bootstrap`
+
+```go
+//go:build !bootstrap
+
+package runner
+
+import (
+	gau_cmd "github.com/lc/gau/v2/cmd/gau"
+	amass_cmd "github.com/owasp-amass/amass/v5/cmd/amass"
+	dnsx_cmd "github.com/projectdiscovery/dnsx/cmd/dnsx"
+	httpx_cmd "github.com/projectdiscovery/httpx/cmd/httpx"
+	katana_cmd "github.com/projectdiscovery/katana/cmd/katana"
+	nuclei_cmd "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"
+	subfinder_cmd "github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
+)
+
+func init() {
+	Register(Tool{Name: "amass", Description: "Run amass OSINT recon tool", Main: amass_cmd.Main})
+	Register(Tool{Name: "nuclei", Description: "Run nuclei scanner", Main: nuclei_cmd.Main})
+	Register(Tool{Name: "httpx", Description: "Run httpx prober", Main: httpx_cmd.Main})
+	Register(Tool{Name: "katana", Description: "Run katana crawler", Main: katana_cmd.Main})
+	Register(Tool{Name: "dnsx", Description: "Run dnsx resolver", Main: dnsx_cmd.Main})
+	Register(Tool{Name: "subfinder", Description: "Run subfinder enumerator", Main: subfinder_cmd.Main})
+	Register(Tool{Name: "gau", Description: "Run gau URL fetcher", Main: gau_cmd.Main})
+}
+```
+
+---
+
+### 5.8 `internal/runner/tools_bootstrap.go` — `//go:build bootstrap`
+
+```go
+//go:build bootstrap
+
+package runner
+```
+
+---
+
+### 5.9 `internal/scope/scope.go`
+
+API pública:
+- `Load(input string) (*Scope, error)` — fichero o string comma-separated
+- `IsInScope(target string) bool` — strip proto/port/path, exclusiones ganan
+- `FilterHosts(hosts []string) []string` — filtro batch
+- `Domains() []string` — `*.example.com` → `example.com`
+- `HasWildcard(target string) bool` — necesario para enumeración
+- `String() string`
+
+Matching: `*.example.com` matchea root + cualquier subdomain. Case-insensitive.
+
+---
+
+### 5.10 `internal/updater/updater.go`
+
+```go
+type ToolSource struct {
+	Name       string
+	URL        string
+	PkgName    string
+	MainFile   string
+	ExtraFiles []string
+}
+
+func DefaultTools() []ToolSource { /* 8 entries */ }
+func UpdateAll(baseDir string)   { /* clone/pull + patch */ }
+```
+
+---
+
+### 5.11 `internal/updater/patcher.go`
+
+- `PatchTool(baseDir, pkgName, relPath)` — `package main` → `package X` + `func main()` → `func Main()`
+- `PatchFile(baseDir, pkgName, relPath)` — solo `package main` → `package X`
+
+---
+
+### 5.12 `internal/updater/selfupdate.go`
+
+```go
+const NarmolRepo = "https://github.com/FOUEN/narmol"
+
+func SelfUpdate()           { resolveSourceDir() → UpdateAll() → rebuildAndReplace() }
+func resolveSourceDir()     { CWD si tiene go.mod narmol, sino ~/.narmol/src/ }
+func rebuildAndReplace()    { go build -o tmp → swap atómico }
+func isNarmolSource(dir)    { busca "module github.com/FOUEN/narmol" en go.mod }
+```
+
+---
+
+### 5.13 `internal/workflows/registry.go`
+
+```go
+type OutputOptions struct { TextFile, JSONFile string }
+
+type Workflow interface {
+	Name() string
+	Description() string
+	Run(domain string, s *scope.Scope, opts OutputOptions) error
+}
+
+func Register(w Workflow) { ... }
+func Get(name string) (Workflow, error) { ... }
+func List() []Workflow { ... }
+```
+
+---
+
+### 5.14 `internal/workflows/active/active.go` — `//go:build !bootstrap`
+
+Pipeline subfinder → httpx via FIFO UNIX (`syscall.Mkfifo`).
+
+Imports clave:
+- `httpx_runner "github.com/projectdiscovery/httpx/runner"`
+- `subfinder_runner "github.com/projectdiscovery/subfinder/v2/pkg/runner"`
+
+Struct `activeResult`: URL, Input, Host, Port, Scheme, StatusCode, Title, Webserver, Tech, CDN, CDNName.
+
+**Problema conocido**: `syscall.Mkfifo` no funciona en Windows.
+
+---
+
+## 6. Grafo de dependencias
+
+```
+main.go
+  ├── internal/cli
+  ├── internal/runner          (_)
+  └── internal/workflows/active (_)
+
+internal/cli
+  ├── internal/runner
+  ├── internal/scope
+  ├── internal/workflows
+  └── internal/updater
+
+internal/workflows/active
+  ├── internal/scope
+  ├── internal/workflows
+  └── httpx/subfinder runners (external)
+
+internal/updater → solo stdlib + exec(git, go build)
+internal/scope   → solo stdlib
+```
+
+---
+
+## 7. Guías para cambios comunes
+
+### Añadir tool (5 ficheros)
+
+1. `internal/updater/updater.go` → `DefaultTools()` nueva entrada
+2. `go.work` → `./tools/newtool`
+3. `go.mod` → `require github.com/org/newtool vX.Y.Z`
+4. `internal/runner/tools.go` → import + `Register(Tool{...})`
+5. `narmol update`
+
+### Añadir workflow (2-3 ficheros)
+
+1. Crear `internal/workflows/<nombre>/<nombre>.go` (con `//go:build !bootstrap` si importa tools externas)
+2. Si tiene `!bootstrap`, crear stub `<nombre>_bootstrap.go`
+3. `main.go` → `_ "github.com/FOUEN/narmol/internal/workflows/<nombre>"`
+
+### Añadir subcomando CLI
+
+1. `internal/cli/cli.go` → nuevo `case` en el switch
+2. Crear `internal/cli/<nombre>.go` con la función
+
+---
+
+## 8. Build
+
+```bash
+go build .                                  # full (desde source, tras narmol update)
+go build -tags bootstrap .                  # bootstrap (sin tools)
+go install -tags bootstrap github.com/FOUEN/narmol@latest  # instalar bootstrap
+narmol update                               # rebuilda binario completo
+```
