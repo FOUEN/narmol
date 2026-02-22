@@ -113,6 +113,34 @@ narmol workflow active -s scope.txt -oj active.json
 {"url":"https://api.example.com","host":"api.example.com","status_code":200,"title":"API","tech":["nginx","React"],"cdn":false}
 ```
 
+### `web` — Full Web Audit
+
+Complete web application audit pipeline: subdomain discovery, live probing, crawling, and vulnerability scanning.
+
+```
+narmol workflow web -s scope.txt -oj web.json
+```
+
+**Pipeline:**
+
+1. **Subfinder** — discovers subdomains (only if scope has wildcard `*.example.com`), always includes the root domain
+2. **httpx** — probes all hosts for live web services (tech detection, CDN detection, title extraction)
+3. **Katana** — crawls live hosts (depth 3, JS scraping, query param dedup, field scope `rdn`)
+4. **Nuclei** — scans all discovered URLs for vulnerabilities (severity: medium, high, critical)
+
+**Behavior:**
+- Stops early if no live hosts are found after httpx
+- Nuclei receives the union of live hosts + crawled endpoints
+- Global deduplication per phase
+- Every result is scope-filtered
+
+**JSON output:**
+```json
+{"phase":"probe","value":"https://api.example.com","host":"api.example.com","status_code":200,"title":"API","tech":["nginx"],"cdn":false}
+{"phase":"crawl","value":"https://api.example.com/v1/users"}
+{"phase":"vuln","value":"https://api.example.com","host":"api.example.com","template_id":"cve-2024-1234","vuln_name":"RCE via X","severity":"critical"}
+```
+
 ### `secrets` — Secret Scanning
 
 Scans for leaked secrets using TruffleHog's 800+ detectors (API keys, tokens, passwords, AWS credentials, etc.).

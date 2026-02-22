@@ -80,8 +80,10 @@ narmol/
 │       │   └── active.go       # ActiveWorkflow — subfinder→httpx (InputTargetHost, cross-platform)
 │       ├── recon/
 │       │   └── recon.go        # ReconWorkflow — subfinder(+recursive)+gau, pasivo
-│       └── secrets/
-│           └── secrets.go      # SecretsWorkflow — TruffleHog secret scanning (git repos, filesystem)
+│       ├── secrets/
+│       │   └── secrets.go      # SecretsWorkflow — TruffleHog secret scanning (git repos, filesystem)
+│       └── web/
+│           └── web.go          # WebWorkflow — subfinder→httpx→katana→nuclei, full web audit
 │
 └── tools/                      # Repos clonados y parcheados (gestionados por narmol update)
     ├── dnsx/
@@ -130,6 +132,7 @@ import (
 	_ "github.com/FOUEN/narmol/internal/workflows/active"
 	_ "github.com/FOUEN/narmol/internal/workflows/recon"
 	_ "github.com/FOUEN/narmol/internal/workflows/secrets"
+	_ "github.com/FOUEN/narmol/internal/workflows/web"
 )
 
 func main() { cli.Run() }
@@ -274,6 +277,10 @@ func UpdateAll(baseDir string)   { /* clone/pull + patch + nuclei test cleanup *
 
 - `PatchTool(baseDir, pkgName, relPath)` — `package main` → `package X` + `func main()` → `func Main()`
 - `PatchFile(baseDir, pkgName, relPath)` — solo `package main` → `package X`
+- `PatchTrufflehogInit()` — mueve init() interceptor de CLI args a Main()
+- `PatchNucleiGitlab()` — int → int64 en campo gitlab
+- `PatchGauCommoncrawl()` — commoncrawl error fatal → logrus.Warnf+continue (non-fatal)
+- `RemoveTestFiles()` — elimina ficheros de test que causan problemas de build (e.g. GitHub Push Protection)
 
 ---
 
@@ -450,6 +457,76 @@ Funciones internas: `scanGit()`, `scanFilesystem()`, `resultToSecret()`, `determ
 
 ---
 
+### 5.16 `internal/workflows/web/web.go`
+
+Workflow de auditoría web completa — **Toca el target activamente**. Pipeline de 4 pasos.
+
+**Pipeline:**
+1. **Subfinder** (solo si wildcard scope) — enumeración pasiva de subdominios + siempre incluye el dominio raíz
+2. **httpx** — probing de hosts vivos con tech detection, CDN, title extraction
+3. **Katana** — crawling de hosts vivos (depth 3, JS scraping, ignora query params, field scope `rdn`)
+4. **Nuclei** — vulnerabilities scan en la unión de hosts vivos + endpoints crawleados (severity: medium, high, critical)
+
+**Comportamiento:**
+- Si no hay live hosts tras httpx → early stop (no ejecuta katana ni nuclei)
+- Nuclei recibe `mergeUnique(liveHosts, endpoints)` como targets
+- Dedup global por fase con `sync.Map` (key = `phase:value`)
+- Scope filter en subfinder callback y katana callback
+- Contadores atómicos (`sync/atomic`) para estadísticas
+
+**Configuración httpx:**
+```go
+Threads: 50, Timeout: 10, FollowRedirects: true, MaxRedirects: 10,
+RateLimit: 150, RandomAgent: true, TechDetect: true, OutputCDN: "true", ExtractTitle: true
+```
+
+**Configuración katana (API pública, NO internal/runner):**
+```go
+katana_types.NewCrawlerOptions(opts) → katana_standard.New(crawlerOptions) → crawler.Crawl(host)
+MaxDepth: 3, RateLimit: 150, Concurrency: 10, Parallelism: 10,
+Strategy: katana_queue.DepthFirst.String(), FieldScope: "rdn",
+ScrapeJSResponses: true, IgnoreQueryParams: true
+```
+
+**Configuración nuclei (SDK lib, NO cmd):**
+```go
+nuclei.NewNucleiEngineCtx(ctx, opts...) → ne.LoadAllTemplates() → ne.LoadTargets() → ne.ExecuteCallbackWithCtx()
+Severity: "medium,high,critical", TemplateConcurrency: 25, HostConcurrency: 25, ProbeConcurrency: 50
+```
+
+Imports clave:
+- `httpx_runner "github.com/projectdiscovery/httpx/runner"`
+- `katana_standard "github.com/projectdiscovery/katana/pkg/engine/standard"`
+- `katana_types "github.com/projectdiscovery/katana/pkg/types"`
+- `katana_queue "github.com/projectdiscovery/katana/pkg/utils/queue"`
+- `katana_output "github.com/projectdiscovery/katana/pkg/output"`
+- `nuclei "github.com/projectdiscovery/nuclei/v3/lib"`
+- `nuclei_output "github.com/projectdiscovery/nuclei/v3/pkg/output"`
+- `subfinder_runner "github.com/projectdiscovery/subfinder/v2/pkg/runner"`
+
+Struct `webResult`:
+```go
+type webResult struct {
+    Phase      string   `json:"phase"`                 // "probe", "crawl", "vuln"
+    Value      string   `json:"value"`                 // URL or matched-at
+    Host       string   `json:"host,omitempty"`
+    StatusCode int      `json:"status_code,omitempty"`
+    Title      string   `json:"title,omitempty"`
+    Tech       []string `json:"tech,omitempty"`
+    Webserver  string   `json:"webserver,omitempty"`
+    CDN        bool     `json:"cdn,omitempty"`
+    CDNName    string   `json:"cdn_name,omitempty"`
+    TemplateID string   `json:"template_id,omitempty"`
+    VulnName   string   `json:"vuln_name,omitempty"`
+    Severity   string   `json:"severity,omitempty"`
+    VulnType   string   `json:"vuln_type,omitempty"`
+}
+```
+
+Funciones internas: `runSubfinder()`, `runHttpx()`, `runKatana()`, `runNuclei()`, `appendUnique()`, `mergeUnique()`
+
+---
+
 ## 6. Grafo de dependencias
 
 ```
@@ -458,7 +535,8 @@ main.go
   ├── internal/runner           (_)
   ├── internal/workflows/active  (_)
   ├── internal/workflows/recon   (_)
-  └── internal/workflows/secrets (_)
+  ├── internal/workflows/secrets (_)
+  └── internal/workflows/web     (_)
 
 internal/cli
   ├── internal/runner
@@ -480,6 +558,11 @@ internal/workflows/secrets
   ├── internal/scope
   ├── internal/workflows
   └── trufflehog engine/sources/detectors (external)
+
+internal/workflows/web
+  ├── internal/scope
+  ├── internal/workflows
+  └── subfinder/httpx/katana/nuclei runners (external)
 
 internal/updater → solo stdlib + exec(git, go build)  ← ÚNICO uso válido de os/exec en todo narmol
 internal/scope   → solo stdlib
@@ -543,21 +626,18 @@ No toca el target directamente. Solo fuentes externas.
 - [x] Dedup global de resultados
 - [x] Output JSON: subdominios + URLs históricas (tipo, valor, fuente, dominio)
 
-#### `web` — Reconocimiento web activo
+#### `web` ✅ (implementado) — Full web audit
 
-Toca el target. Cubre descubrimiento, depuración de superficie, y fingerprinting.
+Toca el target. Pipeline completo: subfinder→httpx→katana→nuclei.
 
-- [ ] Ejecutar `recon` como primer paso
-- [ ] Resolución DNS de todos los subdominios descubiertos (dnsx)
-- [ ] Alive check — hosts con servicio web (httpx)
-- [ ] Tech detection en hosts alive (wappalyzergo)
-- [ ] DNS takeover check (CNAME → dominio inexistente/disponible)
-- [ ] Git exposure check (`/.git/HEAD` accesible) → si expuesto, scan con TruffleHog
-- [ ] Crawling de hosts alive (katana: robots.txt, sitemap, links)
-- [ ] Extracción de endpoints y parámetros desde JavaScript
-- [ ] Secret scanning con TruffleHog en contenido crawleado (JS, respuestas)
-- [ ] Scope filter en cada paso
-- [ ] Output JSON: subdominios, hosts alive, tecnologías, URLs crawleadas, findings
+- [x] Subdomain discovery (subfinder) — solo si scope tiene wildcard
+- [x] Alive check — hosts con servicio web (httpx), tech detection, CDN, title
+- [x] Crawling de hosts alive (katana: depth 3, JS scraping, query param dedup, field scope `rdn`)
+- [x] Vulnerability scan (nuclei: severity medium,high,critical)
+- [x] Scope filter en cada paso
+- [x] Early stop si no hay live hosts
+- [x] Dedup global por fase
+- [x] Output JSON: probe (live hosts), crawl (endpoints), vuln (vulnerabilidades)
 
 #### `vulnscan` — Assessment de vulnerabilidades
 
