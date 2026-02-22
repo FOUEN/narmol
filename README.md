@@ -17,7 +17,7 @@ This clones all tool repos, patches them, and builds the final binary automatica
 ### Option B: `go install`
 
 ```bash
-go install -tags bootstrap github.com/FOUEN/narmol@latest
+go install -tags bootstrap github.com/FOUEN/narmol@v0.1.0
 narmol update
 ```
 
