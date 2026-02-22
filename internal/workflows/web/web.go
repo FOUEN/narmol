@@ -25,6 +25,7 @@ import (
 	"github.com/projectdiscovery/goflags"
 	httpx_runner "github.com/projectdiscovery/httpx/runner"
 	nuclei "github.com/projectdiscovery/nuclei/v3/lib"
+	"github.com/projectdiscovery/nuclei/v3/pkg/installer"
 	nuclei_output "github.com/projectdiscovery/nuclei/v3/pkg/output"
 	"github.com/projectdiscovery/subfinder/v2/pkg/resolve"
 	subfinder_runner "github.com/projectdiscovery/subfinder/v2/pkg/runner"
@@ -53,45 +54,19 @@ func (w *WebWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOp
 		return fmt.Errorf("domain %s is not in scope", domain)
 	}
 
-	// ── Output files ──────────────────────────────────────────────────
-	var textFile, jsonFile *os.File
-	var err error
-	if opts.TextFile != "" {
-		textFile, err = os.OpenFile(opts.TextFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			return fmt.Errorf("failed to open text output: %w", err)
-		}
-		defer textFile.Close()
-	}
-	if opts.JSONFile != "" {
-		jsonFile, err = os.OpenFile(opts.JSONFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			return fmt.Errorf("failed to open JSON output: %w", err)
-		}
-		defer jsonFile.Close()
-	}
-
-	emit := func(r webResult) {
-		if textFile == nil && jsonFile == nil {
-			fmt.Println(r.summary())
-		}
-		if textFile != nil {
-			fmt.Fprintln(textFile, r.summary())
-		}
-		if jsonFile != nil {
-			if js, jErr := json.Marshal(r); jErr == nil {
-				fmt.Fprintln(jsonFile, string(js))
-			}
-		}
+	// ── Report collector ──────────────────────────────────────────────
+	report := &webReport{
+		Target: domain,
+		Date:   time.Now().UTC().Format(time.RFC3339),
 	}
 
 	seen := &sync.Map{}
-	emitUnique := func(r webResult) bool {
+	collect := func(r webResult) bool {
 		key := r.Phase + ":" + r.Value
 		if _, loaded := seen.LoadOrStore(key, true); loaded {
 			return false
 		}
-		emit(r)
+		report.add(r)
 		return true
 	}
 
@@ -106,7 +81,7 @@ func (w *WebWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOp
 	fmt.Printf("[+] %d hosts to probe\n", len(hosts))
 
 	// ── Step 2: httpx — probe + fingerprint ───────────────────────────
-	liveHosts, techSet := w.runHttpx(hosts, s, emitUnique)
+	liveHosts, techSet := w.runHttpx(hosts, s, collect)
 
 	if len(liveHosts) == 0 {
 		fmt.Println("[!] No live hosts found — stopping workflow")
@@ -119,62 +94,56 @@ func (w *WebWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOp
 	fmt.Printf("[+] Nuclei tags from fingerprint: %s\n", strings.Join(tags, ", "))
 
 	var wg sync.WaitGroup
-	var vulnCount, secretCount, headerCount, tlsCount, redirectCount, smuggleCount int64
 
 	// 3a. Nuclei — targeted vulnerability scan
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		vulnCount = w.runNuclei(liveHosts, tags, emitUnique)
+		w.runNuclei(liveHosts, tags, collect)
 	}()
 
 	// 3b. TruffleHog — check for exposed .git repos and scan for secrets
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		secretCount = w.runGitExposureCheck(liveHosts, emitUnique)
+		w.runGitExposureCheck(liveHosts, collect)
 	}()
 
 	// 3c. Security header checks — CORS, missing headers, cookies (stdlib)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		headerCount = w.runSecurityHeaderChecks(liveHosts, emitUnique)
+		w.runSecurityHeaderChecks(liveHosts, collect)
 	}()
 
 	// 3d. SSL/TLS configuration checks (stdlib crypto/tls)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		tlsCount = w.runTLSChecks(liveHosts, emitUnique)
+		w.runTLSChecks(liveHosts, collect)
 	}()
 
 	// 3e. Open redirect detection (stdlib)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		redirectCount = w.runOpenRedirectChecks(liveHosts, emitUnique)
+		w.runOpenRedirectChecks(liveHosts, collect)
 	}()
 
 	// 3f. HTTP request smuggling detection (stdlib net)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		smuggleCount = w.runSmugglingChecks(liveHosts, emitUnique)
+		w.runSmugglingChecks(liveHosts, collect)
 	}()
 
 	wg.Wait()
 
-	// ── Summary ───────────────────────────────────────────────────────
-	if opts.TextFile != "" {
-		fmt.Printf("[+] Text results saved to: %s\n", opts.TextFile)
-	}
-	if opts.JSONFile != "" {
-		fmt.Printf("[+] JSON results saved to: %s\n", opts.JSONFile)
-	}
-	fmt.Printf("[+] Workflow 'web' completed — %d live, %d techs, %d vulns, %d secrets, %d headers, %d tls, %d redirects, %d smuggling\n",
-		len(liveHosts), len(techSet), vulnCount, secretCount, headerCount, tlsCount, redirectCount, smuggleCount)
-	return nil
+	// ── Generate & write report ───────────────────────────────────────
+	report.HostsDiscovered = len(hosts)
+	report.HostsLive = len(liveHosts)
+	report.TechCount = len(techSet)
+	return report.write(opts)
 }
 
 // ─── Step 1: Subfinder ──────────────────────────────────────────────────
@@ -302,6 +271,13 @@ func (w *WebWorkflow) runNuclei(targets []string, tags []string, emitUnique func
 	var vulnCount int64
 	ctx := context.Background()
 
+	// Ensure nuclei templates are installed (first-run auto-download)
+	tm := &installer.TemplateManager{}
+	if err := tm.FreshInstallIfNotExists(); err != nil {
+		fmt.Printf("[!] Could not install nuclei templates: %s\n", err)
+		return 0
+	}
+
 	ne, err := nuclei.NewNucleiEngineCtx(ctx,
 		nuclei.WithTemplateFilters(nuclei.TemplateFilters{
 			Severity: "medium,high,critical",
@@ -410,6 +386,288 @@ func appendUnique(slice []string, item string) []string {
 		}
 	}
 	return append(slice, item)
+}
+
+// ─── Report types ───────────────────────────────────────────────────────
+
+// webReport collects all findings organized by phase for structured report generation.
+type webReport struct {
+	mu              sync.Mutex
+	Target          string
+	Date            string
+	HostsDiscovered int
+	HostsLive       int
+	TechCount       int
+	Probes          []webResult
+	Vulns           []webResult
+	Secrets         []webResult
+	Headers         []webResult
+	TLS             []webResult
+	Redirects       []webResult
+	Smuggling       []webResult
+}
+
+func (rpt *webReport) add(r webResult) {
+	rpt.mu.Lock()
+	defer rpt.mu.Unlock()
+	switch r.Phase {
+	case "probe":
+		rpt.Probes = append(rpt.Probes, r)
+	case "vuln":
+		rpt.Vulns = append(rpt.Vulns, r)
+	case "secret":
+		rpt.Secrets = append(rpt.Secrets, r)
+	case "header":
+		rpt.Headers = append(rpt.Headers, r)
+	case "tls":
+		rpt.TLS = append(rpt.TLS, r)
+	case "redirect":
+		rpt.Redirects = append(rpt.Redirects, r)
+	case "smuggling":
+		rpt.Smuggling = append(rpt.Smuggling, r)
+	}
+}
+
+func (rpt *webReport) write(opts workflows.OutputOptions) error {
+	textReport := rpt.formatText()
+
+	// Always print to console
+	fmt.Print(textReport)
+
+	// Text file
+	if opts.TextFile != "" {
+		if err := os.WriteFile(opts.TextFile, []byte(textReport), 0644); err != nil {
+			return fmt.Errorf("failed to write text report: %w", err)
+		}
+		fmt.Printf("[+] Text report saved to: %s\n", opts.TextFile)
+	}
+
+	// JSON file
+	if opts.JSONFile != "" {
+		js, err := json.MarshalIndent(rpt.jsonData(), "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal JSON report: %w", err)
+		}
+		if err := os.WriteFile(opts.JSONFile, js, 0644); err != nil {
+			return fmt.Errorf("failed to write JSON report: %w", err)
+		}
+		fmt.Printf("[+] JSON report saved to: %s\n", opts.JSONFile)
+	}
+
+	return nil
+}
+
+// reportJSON is the structured JSON output for report generation.
+type reportJSON struct {
+	Target  string        `json:"target"`
+	Date    string        `json:"date"`
+	Summary reportSummary `json:"summary"`
+	Phases  reportPhases  `json:"phases"`
+}
+
+type reportSummary struct {
+	HostsDiscovered int `json:"hosts_discovered"`
+	HostsLive       int `json:"hosts_live"`
+	Technologies    int `json:"technologies_detected"`
+	Vulnerabilities int `json:"vulnerabilities"`
+	Secrets         int `json:"secrets"`
+	HeaderIssues    int `json:"header_issues"`
+	TLSIssues       int `json:"tls_issues"`
+	Redirects       int `json:"redirects"`
+	Smuggling       int `json:"smuggling"`
+}
+
+type reportPhases struct {
+	Discovery       []webResult `json:"discovery"`
+	Vulnerabilities []webResult `json:"vulnerabilities"`
+	Secrets         []webResult `json:"secrets"`
+	Headers         []webResult `json:"header_issues"`
+	TLS             []webResult `json:"tls_issues"`
+	Redirects       []webResult `json:"redirects"`
+	Smuggling       []webResult `json:"smuggling"`
+}
+
+func (rpt *webReport) jsonData() reportJSON {
+	ensureSlice := func(s []webResult) []webResult {
+		if s == nil {
+			return []webResult{}
+		}
+		return s
+	}
+	return reportJSON{
+		Target: rpt.Target,
+		Date:   rpt.Date,
+		Summary: reportSummary{
+			HostsDiscovered: rpt.HostsDiscovered,
+			HostsLive:       rpt.HostsLive,
+			Technologies:    rpt.TechCount,
+			Vulnerabilities: len(rpt.Vulns),
+			Secrets:         len(rpt.Secrets),
+			HeaderIssues:    len(rpt.Headers),
+			TLSIssues:       len(rpt.TLS),
+			Redirects:       len(rpt.Redirects),
+			Smuggling:       len(rpt.Smuggling),
+		},
+		Phases: reportPhases{
+			Discovery:       ensureSlice(rpt.Probes),
+			Vulnerabilities: ensureSlice(rpt.Vulns),
+			Secrets:         ensureSlice(rpt.Secrets),
+			Headers:         ensureSlice(rpt.Headers),
+			TLS:             ensureSlice(rpt.TLS),
+			Redirects:       ensureSlice(rpt.Redirects),
+			Smuggling:       ensureSlice(rpt.Smuggling),
+		},
+	}
+}
+
+func (rpt *webReport) formatText() string {
+	var b strings.Builder
+	line := strings.Repeat("\u2500", 70)
+	doubleLine := strings.Repeat("\u2550", 70)
+
+	// ── Header ──
+	b.WriteString("\n" + doubleLine + "\n")
+	b.WriteString("  NARMOL \u2014 Web Security Audit Report\n")
+	b.WriteString("  Target: " + rpt.Target + "\n")
+	b.WriteString("  Date:   " + rpt.Date + "\n")
+	b.WriteString(doubleLine + "\n")
+
+	// ── Phase 1: Discovery ──
+	b.WriteString("\n" + line + "\n")
+	b.WriteString("  1. DISCOVERY & FINGERPRINTING\n")
+	b.WriteString(line + "\n")
+	if len(rpt.Probes) == 0 {
+		b.WriteString("  No live hosts found.\n")
+	} else {
+		for _, r := range rpt.Probes {
+			b.WriteString("  " + r.summary() + "\n")
+		}
+	}
+
+	// ── Phase 2: Vulnerabilities ──
+	b.WriteString("\n" + line + "\n")
+	b.WriteString("  2. VULNERABILITIES\n")
+	b.WriteString(line + "\n")
+	if len(rpt.Vulns) == 0 {
+		b.WriteString("  No vulnerabilities found.\n")
+	} else {
+		sort.Slice(rpt.Vulns, func(i, j int) bool {
+			return severityOrder(rpt.Vulns[i].Severity) > severityOrder(rpt.Vulns[j].Severity)
+		})
+		for _, r := range rpt.Vulns {
+			b.WriteString("  " + r.summary() + "\n")
+		}
+	}
+
+	// ── Phase 3: Secrets ──
+	b.WriteString("\n" + line + "\n")
+	b.WriteString("  3. SECRETS & EXPOSURES\n")
+	b.WriteString(line + "\n")
+	if len(rpt.Secrets) == 0 {
+		b.WriteString("  No secrets or exposures found.\n")
+	} else {
+		for _, r := range rpt.Secrets {
+			b.WriteString("  " + r.summary() + "\n")
+		}
+	}
+
+	// ── Phase 4: Headers ──
+	b.WriteString("\n" + line + "\n")
+	b.WriteString("  4. SECURITY HEADERS\n")
+	b.WriteString(line + "\n")
+	if len(rpt.Headers) == 0 {
+		b.WriteString("  No header issues found.\n")
+	} else {
+		for _, r := range rpt.Headers {
+			b.WriteString("  " + r.summary() + "\n")
+		}
+	}
+
+	// ── Phase 5: TLS ──
+	b.WriteString("\n" + line + "\n")
+	b.WriteString("  5. TLS / SSL CONFIGURATION\n")
+	b.WriteString(line + "\n")
+	if len(rpt.TLS) == 0 {
+		b.WriteString("  No TLS issues found.\n")
+	} else {
+		for _, r := range rpt.TLS {
+			b.WriteString("  " + r.summary() + "\n")
+		}
+	}
+
+	// ── Phase 6: Redirects ──
+	b.WriteString("\n" + line + "\n")
+	b.WriteString("  6. OPEN REDIRECTS\n")
+	b.WriteString(line + "\n")
+	if len(rpt.Redirects) == 0 {
+		b.WriteString("  No open redirects found.\n")
+	} else {
+		for _, r := range rpt.Redirects {
+			b.WriteString("  " + r.summary() + "\n")
+		}
+	}
+
+	// ── Phase 7: Smuggling ──
+	b.WriteString("\n" + line + "\n")
+	b.WriteString("  7. HTTP REQUEST SMUGGLING\n")
+	b.WriteString(line + "\n")
+	if len(rpt.Smuggling) == 0 {
+		b.WriteString("  No smuggling issues found.\n")
+	} else {
+		for _, r := range rpt.Smuggling {
+			b.WriteString("  " + r.summary() + "\n")
+		}
+	}
+
+	// ── Summary ──
+	b.WriteString("\n" + doubleLine + "\n")
+	b.WriteString("  SUMMARY\n")
+	b.WriteString(doubleLine + "\n")
+	b.WriteString(fmt.Sprintf("  Hosts:           %d discovered, %d live\n", rpt.HostsDiscovered, rpt.HostsLive))
+	b.WriteString(fmt.Sprintf("  Technologies:    %d detected\n", rpt.TechCount))
+	b.WriteString(fmt.Sprintf("  Vulnerabilities: %s\n", rpt.vulnBreakdown()))
+	b.WriteString(fmt.Sprintf("  Secrets:         %d\n", len(rpt.Secrets)))
+	b.WriteString(fmt.Sprintf("  Header Issues:   %d\n", len(rpt.Headers)))
+	b.WriteString(fmt.Sprintf("  TLS Issues:      %d\n", len(rpt.TLS)))
+	b.WriteString(fmt.Sprintf("  Redirects:       %d\n", len(rpt.Redirects)))
+	b.WriteString(fmt.Sprintf("  Smuggling:       %d\n", len(rpt.Smuggling)))
+	b.WriteString(doubleLine + "\n")
+
+	return b.String()
+}
+
+func (rpt *webReport) vulnBreakdown() string {
+	if len(rpt.Vulns) == 0 {
+		return "0"
+	}
+	counts := map[string]int{}
+	for _, v := range rpt.Vulns {
+		counts[v.Severity]++
+	}
+	var parts []string
+	for _, sev := range []string{"critical", "high", "medium", "low", "info"} {
+		if c, ok := counts[sev]; ok && c > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", c, sev))
+		}
+	}
+	return fmt.Sprintf("%d (%s)", len(rpt.Vulns), strings.Join(parts, ", "))
+}
+
+func severityOrder(s string) int {
+	switch strings.ToLower(s) {
+	case "critical":
+		return 5
+	case "high":
+		return 4
+	case "medium":
+		return 3
+	case "low":
+		return 2
+	case "info":
+		return 1
+	default:
+		return 0
+	}
 }
 
 // ─── Nessus-style fingerprint → tag mapping ───────────────────────────────

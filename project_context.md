@@ -487,6 +487,13 @@ Funciones internas: `scanGit()`, `scanFilesystem()`, `resultToSecret()`, `determ
 
 Workflow de auditoría web estilo Nessus — **fingerprint primero, scan después**. Post-httpx todo corre en paralelo con goroutines.
 
+**Output: formato report profesional por fases.**
+Los resultados se recopilan en memoria (`webReport`) y al final se generan:
+- **Texto** — report organizado por secciones (Discovery, Vulnerabilities, Secrets, Headers, TLS, Redirects, Smuggling) con resumen al final.
+- **JSON** — objeto estructurado con `target`, `date`, `summary` (contadores) y `phases` (arrays por fase). Listo para generar informes.
+
+**Templates nuclei:** Se asegura su descarga automática antes del scan con `installer.TemplateManager{}.FreshInstallIfNotExists()`.
+
 **Pipeline (3 pasos, paso 3 paralelo):**
 1. **Subfinder** (solo si wildcard scope) — enumeración pasiva de subdominios
 2. **httpx** — probing + fingerprinting: tech detection (wappalyzer), web server, CDN, title
@@ -494,64 +501,40 @@ Workflow de auditoría web estilo Nessus — **fingerprint primero, scan despué
    - **Nuclei** — vulnerability scan filtrado por tags del fingerprint
    - **TruffleHog** — check `.git/HEAD` exposure → si expuesto, scan de secretos (usa API pública `secrets.ScanGitRepo()`)
    - **Security headers** — checks de stdlib: HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, CORS misconfig, cookie flags
+   - **TLS/SSL** — protocol version, weak ciphers, cert validity, hostname mismatch
+   - **Open redirects** — parameter-based redirect testing (18 common params)
+   - **HTTP smuggling** — CL.TE / TE.CL timing-based detection
 
-**Git exposure check:**
-- HTTP GET a `{host}/.git/HEAD` con timeout 5s, sin follow redirects
-- Si respuesta 200 + body empieza con "ref: refs/" → repo git expuesto
-- Ejecuta `secrets.ScanGitRepo(host)` para buscar secretos filtrados
-- Concurrencia limitada a 20 goroutines (semaphore pattern)
-
-**Security header checks (stdlib, sin tools externas):**
-- Missing: Strict-Transport-Security, X-Content-Type-Options, X-Frame-Options, Content-Security-Policy, Referrer-Policy, Permissions-Policy
-- CORS: `Access-Control-Allow-Origin: *` o reflected origin + `Allow-Credentials: true`
-- Cookies: missing Secure, HttpOnly, SameSite flags
-- Usa `Origin: https://evil.com` en request para detectar CORS reflection
-- Concurrencia limitada a 20 goroutines (semaphore pattern)
-
-**Configuración httpx:**
-```go
-Threads: 50, Timeout: 10, FollowRedirects: true, MaxRedirects: 10,
-RateLimit: 150, RandomAgent: true, TechDetect: true, OutputCDN: "true", ExtractTitle: true
-// Retorna: ([]string liveHosts, map[string]struct{} techSet)
-```
-
-**Configuración nuclei (SDK lib):**
-```go
-nuclei.WithTemplateFilters(nuclei.TemplateFilters{
-    Severity: "medium,high,critical",
-    Tags:     tags, // computed from buildNucleiTags(techSet)
-})
+**Struct de report JSON:**
+```json
+{
+  "target": "example.com",
+  "date": "2024-...",
+  "summary": { "hosts_discovered": N, "hosts_live": N, "vulnerabilities": N, ... },
+  "phases": {
+    "discovery": [...],
+    "vulnerabilities": [...],
+    "secrets": [...],
+    "header_issues": [...],
+    "tls_issues": [...],
+    "redirects": [...],
+    "smuggling": [...]
+  }
+}
 ```
 
 Imports clave:
 - `httpx_runner "github.com/projectdiscovery/httpx/runner"`
 - `nuclei "github.com/projectdiscovery/nuclei/v3/lib"`
+- `"github.com/projectdiscovery/nuclei/v3/pkg/installer"` — template auto-download
 - `nuclei_output "github.com/projectdiscovery/nuclei/v3/pkg/output"`
 - `subfinder_runner "github.com/projectdiscovery/subfinder/v2/pkg/runner"`
 - `"github.com/FOUEN/narmol/internal/workflows/secrets"` — para TruffleHog
 - `"crypto/tls"`, `"net"`, `"net/http"`, `"time"` — para checks de stdlib
 
-Struct `webResult`:
-```go
-type webResult struct {
-    Phase      string   `json:"phase"`                 // "probe", "vuln", "secret", "header"
-    Value      string   `json:"value"`
-    Host       string   `json:"host,omitempty"`
-    StatusCode int      `json:"status_code,omitempty"`
-    Title      string   `json:"title,omitempty"`
-    Tech       []string `json:"tech,omitempty"`
-    Webserver  string   `json:"webserver,omitempty"`
-    CDN        bool     `json:"cdn,omitempty"`
-    CDNName    string   `json:"cdn_name,omitempty"`
-    TemplateID string   `json:"template_id,omitempty"`
-    VulnName   string   `json:"vuln_name,omitempty"`
-    Severity   string   `json:"severity,omitempty"`
-    VulnType   string   `json:"vuln_type,omitempty"`
-    Detail     string   `json:"detail,omitempty"`      // extra detail for header/secret findings
-}
-```
+Structs: `webResult`, `webReport`, `reportJSON`, `reportSummary`, `reportPhases`
 
-Funciones: `runSubfinder()`, `runHttpx()`, `runNuclei()`, `runGitExposureCheck()`, `runSecurityHeaderChecks()`, `runTLSChecks()`, `runOpenRedirectChecks()`, `runSmugglingChecks()`, `testSmuggling()`, `buildNucleiTags()`, `appendUnique()`
+Funciones: `runSubfinder()`, `runHttpx()`, `runNuclei()`, `runGitExposureCheck()`, `runSecurityHeaderChecks()`, `runTLSChecks()`, `runOpenRedirectChecks()`, `runSmugglingChecks()`, `testSmuggling()`, `buildNucleiTags()`, `appendUnique()`, `severityOrder()`
 
 Variables globales: `alwaysTags`, `techTagMap` (50+ entries), `requiredHeaders` (6 security headers), `weakCiphers` (8 insecure suites), `openRedirectParams` (18 common params)
 
