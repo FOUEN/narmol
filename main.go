@@ -8,6 +8,7 @@ import (
 	_ "github.com/FOUEN/narmol/internal/workflows/active"
 	_ "github.com/FOUEN/narmol/internal/workflows/alive"
 	_ "github.com/FOUEN/narmol/internal/workflows/crawl"
+	_ "github.com/FOUEN/narmol/internal/workflows/full"
 	_ "github.com/FOUEN/narmol/internal/workflows/gitexpose"
 	_ "github.com/FOUEN/narmol/internal/workflows/headers"
 	_ "github.com/FOUEN/narmol/internal/workflows/recon"

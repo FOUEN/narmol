@@ -45,6 +45,8 @@ narmol workflow <name> -s scope.txt [-o [file]] [-oj [file]]
 
 **web** — Full web audit (Nessus-style). Fingerprint → targeted nuclei + header/TLS/redirect/smuggling checks in parallel. Report-style output by phases.
 
+**full** — Complete scan: recon + probe + crawl + port scan (naabu top-1000) + vuln assessment. Everything in one run.
+
 **secrets** — TruffleHog secret scanning (git repos or filesystem).
 
 **subdomains** — Recursive subfinder + dnsx resolution.

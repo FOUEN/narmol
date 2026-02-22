@@ -538,6 +538,47 @@ Funciones: `runSubfinder()`, `runHttpx()`, `runNuclei()`, `runGitExposureCheck()
 
 Variables globales: `alwaysTags`, `techTagMap` (50+ entries), `requiredHeaders` (6 security headers), `weakCiphers` (8 insecure suites), `openRedirectParams` (18 common params)
 
+### 5.17 `internal/workflows/full/full.go`
+
+Workflow de scan completo — orquesta **todas** las capacidades de narmol en un pipeline unificado de 5 fases.
+
+**Output: report profesional por fases (10 secciones).**
+Los resultados se recopilan en memoria (`fullReport`) y al final se generan:
+- **Texto** — report organizado en 10 secciones: Recon, Discovery, URLs, Ports, Vulnerabilities, Secrets, Headers, TLS, Redirects, Smuggling + Summary.
+- **JSON** — objeto estructurado con `target`, `date`, `summary` (contadores) y `phases` (10 arrays).
+
+**Pipeline (5 fases):**
+1. **RECON (pasivo, paralelo):** subfinder recursivo (3 rounds) + gau (wayback + otx + urlscan)
+2. **PROBE:** httpx en todos los hosts descubiertos — fingerprinting tech, web server, CDN, title
+3. **CRAWL + PORT SCAN (paralelo):**
+   - Katana (depth 3, breadth-first, known files) en hosts vivos
+   - Naabu (top 1000, connect scan, rate 1500) en subdominios + IPs/CIDRs del scope
+4. **VULN ASSESSMENT (6 goroutines paralelas):**
+   - Nuclei — tags derivados del fingerprint
+   - Git exposure + TruffleHog
+   - Security headers (HSTS, CSP, XFO, XCTO, RP, PP, CORS, cookies)
+   - TLS/SSL (protocol, ciphers, cert validity, hostname)
+   - Open redirects (18 params)
+   - HTTP smuggling (CL.TE / TE.CL)
+5. **REPORT:** output unificado texto + JSON
+
+**Templates nuclei:** `installer.TemplateManager{}.FreshInstallIfNotExists()`
+
+Imports clave:
+- `naabu_runner "github.com/projectdiscovery/naabu/v2/pkg/runner"` — port scanning
+- `naabu_result "github.com/projectdiscovery/naabu/v2/pkg/result"` — HostResult callback
+- `"github.com/projectdiscovery/naabu/v2/pkg/port"` — Port struct
+- `subfinder_runner`, `httpx_runner`, `nuclei`, `nuclei_output`, `installer`
+- `katana_standard`, `katana_types`, `katana_output` — crawler engine
+- `gau_providers`, `gau_runner` — URL harvesting
+- `"github.com/FOUEN/narmol/internal/workflows/secrets"` — TruffleHog
+
+Structs: `finding`, `fullReport`, `fullReportJSON`, `fullSummary`, `fullReportPhases`
+
+Funciones: `runSubfinder()`, `runSubfinderRecursive()`, `runGau()`, `runHttpx()`, `runKatana()`, `runNaabu()`, `runNuclei()`, `runGitExposureCheck()`, `runSecurityHeaderChecks()`, `runTLSChecks()`, `runOpenRedirectChecks()`, `runSmugglingChecks()`, `testSmuggling()`, `buildNucleiTags()`
+
+Variables globales: `alwaysTags`, `techTagMap` (50+ entries), `requiredHeaders`, `weakCiphers`, `openRedirectParams`
+
 ---
 
 ## 6. Grafo de dependencias
@@ -549,6 +590,7 @@ main.go
   ├── internal/workflows/active   (_)
   ├── internal/workflows/alive    (_)
   ├── internal/workflows/crawl    (_)
+  ├── internal/workflows/full     (_)
   ├── internal/workflows/gitexpose(_)
   ├── internal/workflows/headers  (_)
   ├── internal/workflows/recon    (_)
@@ -593,6 +635,11 @@ internal/workflows/web
   ├── internal/scope
   ├── internal/workflows
   └── subfinder/httpx/nuclei runners (external)
+
+internal/workflows/full
+  ├── internal/scope
+  ├── internal/workflows
+  └── subfinder/httpx/nuclei/katana/gau/naabu runners (external)
 
 internal/updater → solo stdlib + exec(git, go build)  ← ÚNICO uso válido de os/exec en todo narmol
 internal/scope   → solo stdlib
@@ -682,16 +729,17 @@ Todo lo que iba a hacer `vulnscan` ya lo hace `web` directamente:
 
 No se necesita un workflow separado.
 
-#### `full` — Scan completo
+#### `full` ✅ (implementado) — Scan completo
 
-Orquesta todos los core workflows + soporte de IPs/CIDR.
+Orquesta todos los core workflows + port scanning con naabu en un pipeline unificado de 5 fases.
 
-- [ ] Soporte de IPs individuales y CIDR en scope
-- [ ] Ejecutar `recon`
-- [ ] Ejecutar `web`
-- [ ] Secret scanning con TruffleHog (git repos, filesystem, crawled content)
-- [ ] Port scan en IPs/CIDR del scope (si aplica)
-- [ ] Output JSON unificado: superficie completa + vulnerabilidades
+- [x] Soporte de IPs individuales y CIDR en scope (naabu port scan)
+- [x] Ejecutar `recon` (subfinder recursivo + gau)
+- [x] Ejecutar `web` (httpx + nuclei + security checks)
+- [x] Secret scanning con TruffleHog (git exposure check)
+- [x] Port scan con naabu (top 1000, connect scan)
+- [x] Crawling con katana (depth 3, breadth-first)
+- [x] Output JSON unificado: superficie completa + vulnerabilidades (10 secciones)
 
 ---
 
