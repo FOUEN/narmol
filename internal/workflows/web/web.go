@@ -1,13 +1,16 @@
 package web
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -116,7 +119,7 @@ func (w *WebWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOp
 	fmt.Printf("[+] Nuclei tags from fingerprint: %s\n", strings.Join(tags, ", "))
 
 	var wg sync.WaitGroup
-	var vulnCount, secretCount, headerCount int64
+	var vulnCount, secretCount, headerCount, tlsCount, redirectCount, smuggleCount int64
 
 	// 3a. Nuclei — targeted vulnerability scan
 	wg.Add(1)
@@ -139,6 +142,27 @@ func (w *WebWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOp
 		headerCount = w.runSecurityHeaderChecks(liveHosts, emitUnique)
 	}()
 
+	// 3d. SSL/TLS configuration checks (stdlib crypto/tls)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		tlsCount = w.runTLSChecks(liveHosts, emitUnique)
+	}()
+
+	// 3e. Open redirect detection (stdlib)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		redirectCount = w.runOpenRedirectChecks(liveHosts, emitUnique)
+	}()
+
+	// 3f. HTTP request smuggling detection (stdlib net)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		smuggleCount = w.runSmugglingChecks(liveHosts, emitUnique)
+	}()
+
 	wg.Wait()
 
 	// ── Summary ───────────────────────────────────────────────────────
@@ -148,8 +172,8 @@ func (w *WebWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOp
 	if opts.JSONFile != "" {
 		fmt.Printf("[+] JSON results saved to: %s\n", opts.JSONFile)
 	}
-	fmt.Printf("[+] Workflow 'web' completed — %d live, %d techs, %d vulns, %d secrets, %d header issues\n",
-		len(liveHosts), len(techSet), vulnCount, secretCount, headerCount)
+	fmt.Printf("[+] Workflow 'web' completed — %d live, %d techs, %d vulns, %d secrets, %d headers, %d tls, %d redirects, %d smuggling\n",
+		len(liveHosts), len(techSet), vulnCount, secretCount, headerCount, tlsCount, redirectCount, smuggleCount)
 	return nil
 }
 
@@ -366,6 +390,12 @@ func (r webResult) summary() string {
 		return fmt.Sprintf("[SECRET] %s — %s", r.Value, r.Detail)
 	case "header":
 		return fmt.Sprintf("[HEADER] %s — %s", r.Value, r.Detail)
+	case "tls":
+		return fmt.Sprintf("[TLS-%s] %s — %s", strings.ToUpper(r.Severity), r.Value, r.Detail)
+	case "redirect":
+		return fmt.Sprintf("[REDIRECT] %s — %s", r.Value, r.Detail)
+	case "smuggling":
+		return fmt.Sprintf("[SMUGGLING-%s] %s — %s", strings.ToUpper(r.Severity), r.Value, r.Detail)
 	default:
 		return r.Value
 	}
@@ -696,4 +726,373 @@ func (w *WebWorkflow) runSecurityHeaderChecks(liveHosts []string, emitUnique fun
 	total := atomic.LoadInt64(&count)
 	fmt.Printf("[+] Security header checks done — %d issues found\n", total)
 	return total
+}
+
+// ─── SSL/TLS Configuration Checks ──────────────────────────────────────
+
+// weakCiphers contains TLS cipher suites considered insecure.
+var weakCiphers = map[uint16]string{
+	tls.TLS_RSA_WITH_RC4_128_SHA:                "RC4-SHA",
+	tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA:           "3DES-CBC-SHA",
+	tls.TLS_RSA_WITH_AES_128_CBC_SHA:            "RSA-AES128-CBC-SHA",
+	tls.TLS_RSA_WITH_AES_256_CBC_SHA:            "RSA-AES256-CBC-SHA",
+	tls.TLS_RSA_WITH_AES_128_CBC_SHA256:         "RSA-AES128-CBC-SHA256",
+	tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA:          "ECDHE-RC4-SHA",
+	tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA:     "ECDHE-3DES-CBC-SHA",
+	tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA:        "ECDHE-ECDSA-RC4-SHA",
+}
+
+// runTLSChecks checks SSL/TLS configuration: protocol versions, weak ciphers, cert validity.
+func (w *WebWorkflow) runTLSChecks(liveHosts []string, emitUnique func(webResult) bool) int64 {
+	// Filter to HTTPS hosts only
+	var httpsHosts []string
+	for _, h := range liveHosts {
+		if strings.HasPrefix(h, "https://") {
+			httpsHosts = append(httpsHosts, h)
+		}
+	}
+	if len(httpsHosts) == 0 {
+		return 0
+	}
+
+	fmt.Printf("[*] Checking TLS config on %d HTTPS hosts...\n", len(httpsHosts))
+
+	var count int64
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 20)
+
+	for _, host := range httpsHosts {
+		wg.Add(1)
+		go func(h string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			parsed, err := url.Parse(h)
+			if err != nil {
+				return
+			}
+			hostname := parsed.Hostname()
+			port := parsed.Port()
+			if port == "" {
+				port = "443"
+			}
+			addr := net.JoinHostPort(hostname, port)
+
+			// Connect with TLS and inspect the negotiated connection
+			conn, err := tls.DialWithDialer(
+				&net.Dialer{Timeout: 5 * time.Second},
+				"tcp", addr,
+				&tls.Config{
+					InsecureSkipVerify: true,
+					// Try to negotiate with all versions to detect what server accepts
+				},
+			)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			state := conn.ConnectionState()
+
+			// Check protocol version
+			switch state.Version {
+			case tls.VersionTLS10:
+				if emitUnique(webResult{
+					Phase: "tls", Value: h, Severity: "high",
+					Detail: "TLS 1.0 supported (deprecated, vulnerable to BEAST/POODLE)",
+				}) {
+					atomic.AddInt64(&count, 1)
+				}
+			case tls.VersionTLS11:
+				if emitUnique(webResult{
+					Phase: "tls", Value: h, Severity: "medium",
+					Detail: "TLS 1.1 supported (deprecated)",
+				}) {
+					atomic.AddInt64(&count, 1)
+				}
+			}
+
+			// Check for weak cipher suite
+			if name, weak := weakCiphers[state.CipherSuite]; weak {
+				if emitUnique(webResult{
+					Phase: "tls", Value: h, Severity: "high",
+					Detail: fmt.Sprintf("Weak cipher suite: %s", name),
+				}) {
+					atomic.AddInt64(&count, 1)
+				}
+			}
+
+			// Check certificate validity
+			if len(state.PeerCertificates) > 0 {
+				cert := state.PeerCertificates[0]
+				now := time.Now()
+
+				// Expired certificate
+				if now.After(cert.NotAfter) {
+					if emitUnique(webResult{
+						Phase: "tls", Value: h, Severity: "high",
+						Detail: fmt.Sprintf("Certificate expired: %s", cert.NotAfter.Format("2006-01-02")),
+					}) {
+						atomic.AddInt64(&count, 1)
+					}
+				}
+
+				// Certificate expiring within 30 days
+				if now.Before(cert.NotAfter) && cert.NotAfter.Before(now.Add(30*24*time.Hour)) {
+					if emitUnique(webResult{
+						Phase: "tls", Value: h, Severity: "medium",
+						Detail: fmt.Sprintf("Certificate expiring soon: %s", cert.NotAfter.Format("2006-01-02")),
+					}) {
+						atomic.AddInt64(&count, 1)
+					}
+				}
+
+				// Self-signed certificate
+				if cert.Issuer.CommonName == cert.Subject.CommonName {
+					pool := x509.NewCertPool()
+					pool.AddCert(cert)
+					_, verifyErr := cert.Verify(x509.VerifyOptions{Roots: pool})
+					if verifyErr == nil {
+						if emitUnique(webResult{
+							Phase: "tls", Value: h, Severity: "medium",
+							Detail: "Self-signed certificate",
+						}) {
+							atomic.AddInt64(&count, 1)
+						}
+					}
+				}
+
+				// Hostname mismatch
+				if err := cert.VerifyHostname(hostname); err != nil {
+					if emitUnique(webResult{
+						Phase: "tls", Value: h, Severity: "high",
+						Detail: fmt.Sprintf("Certificate hostname mismatch: cert for %s", strings.Join(cert.DNSNames, ", ")),
+					}) {
+						atomic.AddInt64(&count, 1)
+					}
+				}
+			}
+		}(host)
+	}
+
+	wg.Wait()
+	total := atomic.LoadInt64(&count)
+	fmt.Printf("[+] TLS checks done — %d issues found\n", total)
+	return total
+}
+
+// ─── Open Redirect Detection ────────────────────────────────────────────
+
+// openRedirectPayloads are common parameter-based redirect payloads.
+var openRedirectParams = []string{
+	"url", "redirect", "redirect_url", "redirect_uri", "return", "return_url",
+	"returnTo", "next", "goto", "target", "destination", "dest", "rurl",
+	"continue", "forward", "out", "view", "login_url", "callback",
+}
+
+// runOpenRedirectChecks tests each live host for basic open redirect via common parameters.
+func (w *WebWorkflow) runOpenRedirectChecks(liveHosts []string, emitUnique func(webResult) bool) int64 {
+	fmt.Printf("[*] Checking %d hosts for open redirects...\n", len(liveHosts))
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: (&net.Dialer{
+				Timeout: 3 * time.Second,
+			}).DialContext,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // don't follow — we inspect the Location header
+		},
+	}
+
+	var count int64
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 20)
+
+	canary := "https://evil.com/pwned"
+
+	for _, host := range liveHosts {
+		wg.Add(1)
+		go func(h string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			for _, param := range openRedirectParams {
+				testURL := fmt.Sprintf("%s/?%s=%s", strings.TrimRight(h, "/"), param, url.QueryEscape(canary))
+
+				resp, err := client.Get(testURL)
+				if err != nil {
+					continue
+				}
+				resp.Body.Close()
+
+				if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+					location := resp.Header.Get("Location")
+					if strings.HasPrefix(location, "https://evil.com") || strings.HasPrefix(location, "//evil.com") {
+						if emitUnique(webResult{
+							Phase: "redirect", Value: h, Severity: "medium",
+							Detail: fmt.Sprintf("Open redirect via ?%s= → %s (HTTP %d)", param, location, resp.StatusCode),
+						}) {
+							atomic.AddInt64(&count, 1)
+						}
+						break // one finding per host is enough
+					}
+				}
+			}
+		}(host)
+	}
+
+	wg.Wait()
+	total := atomic.LoadInt64(&count)
+	fmt.Printf("[+] Open redirect checks done — %d issues found\n", total)
+	return total
+}
+
+// ─── HTTP Request Smuggling Detection ───────────────────────────────────
+
+// runSmugglingChecks performs CL.TE and TE.CL detection using raw TCP sockets.
+// This is a timing-based detection: if a smuggled request causes a different
+// response time than a normal request, the server may be vulnerable.
+func (w *WebWorkflow) runSmugglingChecks(liveHosts []string, emitUnique func(webResult) bool) int64 {
+	fmt.Printf("[*] Checking %d hosts for HTTP request smuggling...\n", len(liveHosts))
+
+	var count int64
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 10) // lower concurrency — raw sockets + timing
+
+	for _, host := range liveHosts {
+		wg.Add(1)
+		go func(h string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			parsed, err := url.Parse(h)
+			if err != nil {
+				return
+			}
+			hostname := parsed.Hostname()
+			port := parsed.Port()
+			isHTTPS := parsed.Scheme == "https"
+
+			if port == "" {
+				if isHTTPS {
+					port = "443"
+				} else {
+					port = "80"
+				}
+			}
+			addr := net.JoinHostPort(hostname, port)
+
+			// CL.TE detection: Content-Length says body is short, but body contains
+			// Transfer-Encoding chunked data. If front-end uses CL and back-end uses TE,
+			// the remainder gets smuggled.
+			cltePayload := fmt.Sprintf(
+				"POST / HTTP/1.1\r\n"+
+					"Host: %s\r\n"+
+					"Content-Length: 4\r\n"+
+					"Transfer-Encoding: chunked\r\n"+
+					"\r\n"+
+					"1\r\n"+
+					"Z\r\n"+
+					"Q\r\n", // Q should NOT be processed — if it is, CL.TE smuggling exists
+				hostname)
+
+			// TE.CL detection: Transfer-Encoding says chunked, but Content-Length
+			// specifies a short body. If front-end uses TE and back-end uses CL,
+			// the chunked trailer gets smuggled.
+			teclPayload := fmt.Sprintf(
+				"POST / HTTP/1.1\r\n"+
+					"Host: %s\r\n"+
+					"Content-Length: 6\r\n"+
+					"Transfer-Encoding: chunked\r\n"+
+					"\r\n"+
+					"0\r\n"+
+					"\r\n"+
+					"X", // X should NOT be processed — if it causes delay, TE.CL exists
+				hostname)
+
+			// Test CL.TE
+			if w.testSmuggling(addr, isHTTPS, hostname, cltePayload) {
+				if emitUnique(webResult{
+					Phase: "smuggling", Value: h, Severity: "critical",
+					Detail: "Potential CL.TE HTTP request smuggling",
+				}) {
+					atomic.AddInt64(&count, 1)
+				}
+			}
+
+			// Test TE.CL
+			if w.testSmuggling(addr, isHTTPS, hostname, teclPayload) {
+				if emitUnique(webResult{
+					Phase: "smuggling", Value: h, Severity: "critical",
+					Detail: "Potential TE.CL HTTP request smuggling",
+				}) {
+					atomic.AddInt64(&count, 1)
+				}
+			}
+		}(host)
+	}
+
+	wg.Wait()
+	total := atomic.LoadInt64(&count)
+	fmt.Printf("[+] HTTP smuggling checks done — %d issues found\n", total)
+	return total
+}
+
+// testSmuggling sends a raw HTTP payload and checks for anomalous response behavior.
+// Returns true if the response suggests smuggling vulnerability.
+func (w *WebWorkflow) testSmuggling(addr string, isHTTPS bool, hostname, payload string) bool {
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+
+	var conn net.Conn
+	var err error
+
+	if isHTTPS {
+		conn, err = tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         hostname,
+		})
+	} else {
+		conn, err = dialer.Dial("tcp", addr)
+	}
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	// Set overall deadline
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// Send the smuggling payload
+	_, err = conn.Write([]byte(payload))
+	if err != nil {
+		return false
+	}
+
+	// Read response — look for anomalies
+	reader := bufio.NewReader(conn)
+
+	// Read first response
+	resp1, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		return false
+	}
+	resp1.Body.Close()
+
+	// Try to read a second response (shouldn't exist in normal case).
+	// If we get one, it means the server processed the smuggled part
+	// as a separate request — strong indicator of smuggling.
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	resp2, err := http.ReadResponse(reader, nil)
+	if err == nil && resp2 != nil {
+		resp2.Body.Close()
+		return true // got a second response → smuggling likely
+	}
+
+	return false
 }

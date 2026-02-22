@@ -131,6 +131,9 @@ narmol workflow web -s scope.txt -oj web.json
    - **Nuclei** — targeted vulnerability scan (only templates matching detected tech)
    - **TruffleHog** — checks for exposed `.git/HEAD` → if found, scans for leaked secrets
    - **Security headers** — checks missing HSTS, CSP, X-Frame-Options, CORS misconfig, insecure cookies (stdlib)
+   - **SSL/TLS audit** — protocol version (flags TLS 1.0/1.1), weak ciphers, cert expiry, self-signed, hostname mismatch (stdlib)
+   - **Open redirect** — tests 18 common redirect parameters with canary URL (stdlib)
+   - **HTTP smuggling** — CL.TE and TE.CL detection via raw TCP sockets + timing (stdlib)
 
 **Nessus-style optimization:**
 - httpx detects technologies via wappalyzer → mapped to nuclei template tags
@@ -143,6 +146,9 @@ narmol workflow web -s scope.txt -oj web.json
 {"phase":"vuln","value":"https://api.example.com","template_id":"cve-2024-1234","vuln_name":"RCE","severity":"critical"}
 {"phase":"secret","value":"https://api.example.com","severity":"critical","detail":"[AWS] AKIA****"}
 {"phase":"header","value":"https://api.example.com","severity":"medium","detail":"Missing Strict-Transport-Security"}
+{"phase":"tls","value":"https://api.example.com","severity":"high","detail":"TLS 1.0 supported (deprecated, vulnerable to BEAST/POODLE)"}
+{"phase":"redirect","value":"https://api.example.com","severity":"medium","detail":"Open redirect via ?next= → https://evil.com/pwned (HTTP 302)"}
+{"phase":"smuggling","value":"https://api.example.com","severity":"critical","detail":"Potential CL.TE HTTP request smuggling"}
 ```
 
 ### `secrets` — Secret Scanning

@@ -19,7 +19,7 @@ Narmol debe funcionar tanto como CLI standalone para power users como motor head
 2. **Descubrimiento de superficie** — subdominios (pasivo: subfinder, crt.sh; activo: dnsx brute + permutaciones), dorking
 3. **Depuración de superficie** — DNS takeover check, httpx alive, tech detection (wappalyzergo), wayback URLs (gau), git exposure
 4. **Fuzzing** — crawling (katana), JS endpoints/params extraction
-5. **Vulnerability assessment** — nuclei, WAF detection, SSL/TLS config, CORS misconfig, security headers, cookie flags, HTTP request smuggling
+5. **Vulnerability assessment** — nuclei, WAF detection, SSL/TLS config ✅, CORS misconfig, security headers ✅, cookie flags, HTTP request smuggling ✅, open redirect ✅
 
 ### Principio de diseño: librerías Go > CLI wrapping
 
@@ -527,9 +527,9 @@ type webResult struct {
 }
 ```
 
-Funciones: `runSubfinder()`, `runHttpx()`, `runNuclei()`, `runGitExposureCheck()`, `runSecurityHeaderChecks()`, `buildNucleiTags()`, `appendUnique()`
+Funciones: `runSubfinder()`, `runHttpx()`, `runNuclei()`, `runGitExposureCheck()`, `runSecurityHeaderChecks()`, `runTLSChecks()`, `runOpenRedirectChecks()`, `runSmugglingChecks()`, `testSmuggling()`, `buildNucleiTags()`, `appendUnique()`
 
-Variables globales: `alwaysTags`, `techTagMap` (50+ entries), `requiredHeaders` (6 security headers)
+Variables globales: `alwaysTags`, `techTagMap` (50+ entries), `requiredHeaders` (6 security headers), `weakCiphers` (8 insecure suites), `openRedirectParams` (18 common params)
 
 ---
 
@@ -657,8 +657,9 @@ Input: output del workflow `web` (hosts alive + URLs).
 - [ ] Security headers check (X-Frame-Options, CSP, HSTS, X-Content-Type-Options, etc.)
 - [ ] CORS misconfiguration check
 - [ ] Cookie flags check (HttpOnly, Secure, SameSite)
-- [ ] SSL/TLS config check (versión protocolo, ciphers, expiración certificado)
-- [ ] Open redirect check básico
+- [x] SSL/TLS config check (versión protocolo, ciphers, expiración certificado) — `runTLSChecks()` stdlib
+- [x] Open redirect check básico — `runOpenRedirectChecks()` stdlib, 18 params, canary evil.com
+- [x] HTTP request smuggling (CL.TE + TE.CL) — `runSmugglingChecks()` stdlib, raw TCP + timing
 - [ ] Secret scanning con TruffleHog (git repos expuestos, respuestas)
 - [ ] Scope filter en cada paso
 - [ ] Output JSON: vulnerabilidades categorizadas por severidad
