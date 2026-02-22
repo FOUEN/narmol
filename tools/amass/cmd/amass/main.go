@@ -28,7 +28,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"time"
 
 	"github.com/fatih/color"
 	"github.com/owasp-amass/amass/v5/config"
@@ -143,14 +142,16 @@ func Main() {
 
 		ae.CLIWorkflow(cmdName, os.Args[2:])
 	case "enum":
-		// The engine must be started before running the enum command
+		// The engine must be started before running the enum command.
+		// Start it in-process (no subprocess) if not already running.
 		if !engineIsRunning() {
-			if err := startEngine(); err != nil {
+			if err := startEngineInProcess(); err != nil {
 				_, _ = afmt.R.Fprintf(color.Error, "Failed to start the Amass engine: %v\n", err)
 				os.Exit(1)
 			}
-			// Give the engine time to start
-			if err := waitForEngineResponse(); err != nil {
+			defer shutdownEngine()
+			// Wait for the GraphQL endpoint to become available
+			if err := waitForEngine(); err != nil {
 				_, _ = afmt.R.Fprintf(color.Error, "The Amass engine did not respond: %v\n", err)
 				os.Exit(1)
 			}
@@ -168,17 +169,4 @@ func Main() {
 		_, _ = afmt.R.Fprintf(color.Error, "subcommand provided but not defined: %s\n", os.Args[1])
 		os.Exit(1)
 	}
-}
-
-func waitForEngineResponse() error {
-	t := time.NewTicker(time.Second)
-	defer t.Stop()
-
-	for range 60 {
-		<-t.C
-		if engineIsRunning() {
-			return nil
-		}
-	}
-	return fmt.Errorf("the Amass engine did not respond within the timeout period")
 }

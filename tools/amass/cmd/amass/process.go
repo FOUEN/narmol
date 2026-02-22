@@ -6,14 +6,19 @@ package amass
 
 import (
 	"fmt"
-	"io"
+	"log/slog"
 	"os"
-	"path/filepath"
-	"strings"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/owasp-amass/amass/v5/config"
+	amassengine "github.com/owasp-amass/amass/v5/engine"
 	"github.com/owasp-amass/amass/v5/engine/api/graphql/client"
+	"github.com/owasp-amass/amass/v5/internal/tools"
 )
+
+// engineInstance holds the in-process engine so it can be shut down later.
+var engineInstance *amassengine.Engine
 
 func engineIsRunning() bool {
 	c := client.NewClient("http://127.0.0.1:4000/graphql")
@@ -24,41 +29,57 @@ func engineIsRunning() bool {
 	return false
 }
 
-// engineCmdArgs returns the arguments needed to launch the engine subprocess.
-// When running inside a wrapper (e.g., narmol), os.Executable() differs from
-// os.Args[0], so we must include the tool name ("amass") as a prefix argument.
-func engineCmdArgs(execPath string) []string {
-	execBase := strings.TrimSuffix(filepath.Base(execPath), filepath.Ext(filepath.Base(execPath)))
-	argv0Base := strings.TrimSuffix(filepath.Base(os.Args[0]), filepath.Ext(filepath.Base(os.Args[0])))
-
-	if !strings.EqualFold(execBase, argv0Base) {
-		// Running inside a wrapper: e.g. narmol amass engine
-		return []string{argv0Base, "engine"}
+// startEngineInProcess starts the Amass collection engine in the current
+// process as background goroutines. No subprocess is spawned.
+func startEngineInProcess() error {
+	l, err := engineLogger()
+	if err != nil {
+		return fmt.Errorf("failed to create engine logger: %w", err)
 	}
-	return []string{"engine"}
+
+	e, err := amassengine.NewEngine(l)
+	if err != nil {
+		return fmt.Errorf("failed to start engine: %w", err)
+	}
+	engineInstance = e
+	return nil
 }
 
-func startEngine() error {
-	p, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to get executable path: %w", err)
+// shutdownEngine gracefully shuts down the in-process engine if running.
+func shutdownEngine() {
+	if engineInstance != nil {
+		engineInstance.Shutdown()
+		engineInstance = nil
 	}
-	if p == "" {
-		return fmt.Errorf("executable path is empty")
+}
+
+// waitForEngine polls the GraphQL endpoint until the engine responds or times out.
+func waitForEngine() error {
+	t := time.NewTicker(500 * time.Millisecond)
+	defer t.Stop()
+
+	for range 120 { // 120 × 500ms = 60s max
+		<-t.C
+		if engineIsRunning() {
+			return nil
+		}
+	}
+	return fmt.Errorf("the Amass engine did not respond within the timeout period")
+}
+
+// engineLogger creates a logger for the engine, mirroring the logic in
+// the engine CLI workflow.
+func engineLogger() (*slog.Logger, error) {
+	filename := fmt.Sprintf("amass_engine_%s.log", time.Now().Format("2006-01-02T15:04:05"))
+
+	if l, err := tools.NewSyslogLogger(); err == nil && l != nil {
+		return l, nil
 	}
 
-	cmd := initCmd(p, engineCmdArgs(p))
-	if cmd == nil {
-		return fmt.Errorf("failed to initialize command for %s", p)
-	}
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
-	cmd.Stdin = os.Stdin
-
-	cmd.Dir, err = os.Getwd()
-	if err != nil {
-		return err
+	dir := config.OutputDirectory("")
+	if l, err := tools.NewFileLogger(dir, filename); err == nil && l != nil {
+		return l, nil
 	}
 
-	return cmd.Start()
+	return slog.New(slog.NewTextHandler(os.Stdout, nil)), nil
 }

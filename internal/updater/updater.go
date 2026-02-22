@@ -95,26 +95,41 @@ func patchLibpostal(amassDir string) {
 	fmt.Println("[+] Patched amass: disabled libpostal CGO binding")
 }
 
+const sourceFile = ".narmol-source"
+
 // fetchOrClone either git-pulls an existing repo or clones it fresh.
+// It writes a .narmol-source marker file with the origin URL after cloning.
 func fetchOrClone(dir, url string) error {
 	if isGitRepo(dir) {
+		// Fast path: .git exists, just fetch + reset
 		if err := gitCmd(dir, "fetch", "origin"); err != nil {
 			return fmt.Errorf("fetch failed: %w", err)
 		}
 		if err := gitCmd(dir, "reset", "--hard", "origin/HEAD"); err != nil {
 			return fmt.Errorf("reset failed: %w", err)
 		}
-		fmt.Println(" [Done]")
-	} else {
-		fmt.Print("\n    - Not a git repo. Re-cloning...")
-		if err := os.RemoveAll(dir); err != nil {
-			return fmt.Errorf("remove failed: %w", err)
-		}
-		if err := gitCmd(".", "clone", url, dir); err != nil {
-			return fmt.Errorf("clone failed: %w", err)
-		}
-		fmt.Println(" [Cloned]")
+		writeSourceFile(dir, url)
+		fmt.Println(" [Updated]")
+		return nil
 	}
+
+	// No .git — need a fresh clone
+	savedURL := readSourceFile(dir)
+	if savedURL != "" {
+		fmt.Printf("\n    - Source: %s — cloning...", savedURL)
+		url = savedURL // honour the stored origin
+	} else {
+		fmt.Printf("\n    - Cloning from %s...", url)
+	}
+
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("remove failed: %w", err)
+	}
+	if err := gitCmd(".", "clone", url, dir); err != nil {
+		return fmt.Errorf("clone failed: %w", err)
+	}
+	writeSourceFile(dir, url)
+	fmt.Println(" [Cloned]")
 	return nil
 }
 
@@ -123,10 +138,22 @@ func isGitRepo(dir string) bool {
 	return err == nil && info.IsDir()
 }
 
+// writeSourceFile writes the origin URL to .narmol-source inside dir.
+func writeSourceFile(dir, url string) {
+	_ = os.WriteFile(filepath.Join(dir, sourceFile), []byte(url+"\n"), 0644)
+}
+
+// readSourceFile returns the origin URL from .narmol-source, or "" if absent.
+func readSourceFile(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, sourceFile))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
 func gitCmd(dir string, args ...string) error {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }

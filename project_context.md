@@ -6,19 +6,20 @@ Este documento da contexto completo a un modelo de IA para editar código de nar
 
 ## 1. Qué es narmol
 
-Un binario Go que compila 7 herramientas de seguridad externas dentro de sí mismo (no las llama via exec.Command), les añade scope enforcement y permite ejecutar workflows que encadenan herramientas.
+Un binario Go que compila 7 herramientas de seguridad externas dentro de sí mismo (no las llama via exec.Command), les añade scope enforcement y permite ejecutar workflows que encadenan herramientas. **Todo el código se ejecuta in-process como Go nativo — sin subprocesos, sin IPC, sin serialización.** Incluso componentes como el engine de amass (servidor GraphQL) se arrancan como goroutines dentro del mismo proceso.
 
 ---
 
 ## 2. Reglas absolutas
 
-1. **NUNCA `exec.Command` para ejecutar una tool.** Las tools son repos clonados en `tools/`, parcheados para exponer `func Main()`, e importados como paquetes Go.
+1. **NUNCA `exec.Command` / `os/exec` para ejecutar una tool ni componentes internos.** Las tools son repos clonados en `tools/`, parcheados para exponer `func Main()`, e importados como paquetes Go. Todo se ejecuta en el mismo proceso como código Go nativo — llamadas a funciones, goroutines, etc. Esto incluye componentes como el engine de amass, que se arranca in-process con `engine.NewEngine()` en vez de spawneando un subproceso. **El único uso válido de `os/exec` en todo narmol es para invocar `git` y `go build` en el módulo `updater`.**
 2. **Go Workspace obligatorio.** Cada tool en `tools/` tiene su propio `go.mod`. El fichero `go.work` los une.
 3. **Patrón init() para registros.** Tools y workflows se registran en `init()` y se importan en `main.go` con `_`.
 4. **Module path = `github.com/FOUEN/narmol`.** Paquetes internos bajo `internal/`.
 5. **Scope siempre filtra.** Todo workflow recibe `*scope.Scope` y filtra antes de tocar la red.
 6. **Output en modo append.** `os.O_APPEND|os.O_CREATE|os.O_WRONLY`.
 7. **CGO habilitado**, pero la dependencia libpostal de amass se parchea con build tag `ignore` para que no requiera la librería C.
+8. **Máxima eficiencia nativa.** Al compilar todo en un solo binario Go sin subprocesos, se evita overhead de IPC, serialización y context-switching entre procesos. Cada herramienta corre como una llamada a función Go directa dentro del mismo address space.
 
 ---
 
@@ -303,7 +304,7 @@ internal/workflows/active
   ├── internal/workflows
   └── httpx/subfinder runners (external)
 
-internal/updater → solo stdlib + exec(git, go build)
+internal/updater → solo stdlib + exec(git, go build)  ← ÚNICO uso válido de os/exec en todo narmol
 internal/scope   → solo stdlib
 ```
 
