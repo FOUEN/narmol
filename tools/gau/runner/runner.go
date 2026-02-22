@@ -2,7 +2,6 @@ package runner
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	"github.com/lc/gau/v2/pkg/providers"
@@ -35,7 +34,8 @@ func (r *Runner) Init(c *providers.Config, providers []string, filters providers
 		case "commoncrawl":
 			cc, err := commoncrawl.New(c, filters)
 			if err != nil {
-				return fmt.Errorf("error instantiating commoncrawl: %v\n", err)
+				logrus.Warnf("commoncrawl unavailable, skipping: %v", err)
+				continue
 			}
 			r.Providers = append(r.Providers, cc)
 		}

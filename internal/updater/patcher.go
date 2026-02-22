@@ -113,6 +113,41 @@ func RemoveTestFiles(dir string) {
 	}
 }
 
+// PatchGauCommoncrawl makes gau's Runner.Init() resilient to commoncrawl
+// failures. Instead of aborting all providers when commoncrawl is unreachable,
+// it logs a warning and continues with the remaining providers.
+func PatchGauCommoncrawl(baseDir string) {
+	relPath := filepath.Join("runner", "runner.go")
+	filePath := filepath.Join(baseDir, relPath)
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Printf("[!] PatchGauCommoncrawl: file not found: %s\n", filePath)
+		return
+	}
+	src := string(raw)
+	src = strings.ReplaceAll(src, "\r\n", "\n")
+
+	// Replace: return fmt.Errorf("error instantiating commoncrawl: ...") → logrus.Warnf + continue
+	old := `return fmt.Errorf("error instantiating commoncrawl: %v\n", err)`
+	neu := `logrus.Warnf("commoncrawl unavailable, skipping: %v", err)` + "\n\t\t\t\tcontinue"
+
+	if !strings.Contains(src, old) {
+		fmt.Println("[+] PatchGauCommoncrawl: already patched, skipping")
+		return
+	}
+
+	src = strings.Replace(src, old, neu, 1)
+
+	// Remove unused "fmt" import if it becomes the only user
+	src = strings.Replace(src, "\t\"fmt\"\n", "", 1)
+
+	if err := os.WriteFile(filePath, []byte(src), 0644); err != nil {
+		fmt.Printf("[!] PatchGauCommoncrawl: %s\n", err)
+		return
+	}
+	fmt.Println("[+] Patched gau: commoncrawl failure is now non-fatal")
+}
+
 // PatchNucleiGitlab fixes type mismatches in nuclei's gitlab tracker caused
 // by a newer go-gitlab dependency (int → int64) pulled in by trufflehog.
 func PatchNucleiGitlab(baseDir string) {

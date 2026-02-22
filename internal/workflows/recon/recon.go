@@ -249,7 +249,7 @@ func (w *ReconWorkflow) runGau(domain string, s *scope.Scope, emitUnique func(re
 		Blacklist: mapset.NewThreadUnsafeSet(""),
 	}
 
-	providerNames := []string{"wayback", "commoncrawl", "otx", "urlscan"}
+	providerNames := []string{"wayback", "otx", "urlscan"}
 
 	gau := &gau_runner.Runner{}
 	if err := gau.Init(config, providerNames, gau_providers.Filters{}); err != nil {

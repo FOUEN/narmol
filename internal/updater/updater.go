@@ -62,6 +62,12 @@ func UpdateAll(baseDir string) {
 			PatchNucleiGitlab(dir)
 		}
 
+		// Gau-specific: make commoncrawl failure non-fatal so other providers
+		// (wayback, otx, urlscan) still work when commoncrawl is unreachable.
+		if tool.Name == "gau" {
+			PatchGauCommoncrawl(dir)
+		}
+
 		// Trufflehog-specific: move init() body into Main() so kingpin doesn't
 		// intercept narmol's CLI args at import time. Also remove test files
 		// that contain sample secrets (blocked by GitHub Push Protection).
