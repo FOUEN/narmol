@@ -91,7 +91,6 @@ func rebuildAndReplace(srcDir string) {
 
 	build := exec.Command("go", "build", "-o", tmpBin, ".")
 	build.Dir = srcDir
-	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	build.Stdout = os.Stdout
 	build.Stderr = os.Stderr
 

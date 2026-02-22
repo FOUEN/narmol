@@ -7,7 +7,7 @@ All-in-one security toolkit. One binary, multiple tools, scope-enforced workflow
 ```bash
 git clone https://github.com/FOUEN/narmol.git
 cd narmol
-CGO_ENABLED=0 go run . update
+go run . update
 ```
 
 This downloads all tools, patches them, and builds the `narmol` binary. Done.

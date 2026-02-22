@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 // ToolSource defines the git URL and patch info for an external tool.
@@ -57,7 +58,41 @@ func UpdateAll(baseDir string) {
 		if tool.Name == "nuclei" {
 			os.Remove(filepath.Join(dir, "cmd", "nuclei", "main_benchmark_test.go"))
 		}
+
+		// Amass-specific: disable the CGO libpostal binding so the build
+		// doesn't require the libpostal C library. The pure-Go fallback
+		// provides the same functionality via an HTTP API.
+		if tool.Name == "amass" {
+			patchLibpostal(dir)
+		}
 	}
+}
+
+// patchLibpostal disables the CGO libpostal binding in amass so that
+// users don't need the libpostal C library installed. The pure-Go
+// fallback (pure_go.go) is promoted to be used unconditionally.
+func patchLibpostal(amassDir string) {
+	libDir := filepath.Join(amassDir, "internal", "libpostal")
+
+	// 1. Make cgo_specific.go unreachable by setting build tag to "ignore"
+	cgoFile := filepath.Join(libDir, "cgo_specific.go")
+	data, err := os.ReadFile(cgoFile)
+	if err == nil {
+		patched := strings.Replace(string(data), "//go:build cgo", "//go:build ignore", 1)
+		patched = strings.Replace(patched, "// +build cgo", "// +build ignore", 1)
+		os.WriteFile(cgoFile, []byte(patched), 0644)
+	}
+
+	// 2. Remove the build constraint from pure_go.go so it compiles always
+	pureFile := filepath.Join(libDir, "pure_go.go")
+	data, err = os.ReadFile(pureFile)
+	if err == nil {
+		patched := strings.Replace(string(data), "//go:build !cgo", "//go:build !ignore", 1)
+		patched = strings.Replace(patched, "// +build !cgo", "// +build !ignore", 1)
+		os.WriteFile(pureFile, []byte(patched), 0644)
+	}
+
+	fmt.Println("[+] Patched amass: disabled libpostal CGO binding")
 }
 
 // fetchOrClone either git-pulls an existing repo or clones it fresh.
