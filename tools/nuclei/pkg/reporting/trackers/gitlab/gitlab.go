@@ -16,7 +16,7 @@ import (
 // Integration is a client for an issue tracker integration
 type Integration struct {
 	client  *gitlab.Client
-	userID  int
+	userID  int64
 	options *Options
 }
 
@@ -85,7 +85,7 @@ func (i *Integration) CreateIssue(event *output.ResultEvent) (*filters.CreateIss
 		labels = append(labels, label)
 	}
 	customLabels := gitlab.LabelOptions(labels)
-	assigneeIDs := []int{i.userID}
+	assigneeIDs := []int64{i.userID}
 
 	var issue *gitlab.Issue
 	if i.options.DuplicateIssueCheck {
@@ -157,15 +157,16 @@ func (i *Integration) CloseIssue(event *output.ResultEvent) error {
 }
 
 func (i *Integration) findIssueByTitle(title string) (*gitlab.Issue, error) {
-	pageSize := i.options.DuplicateIssuePageSize
-	if pageSize <= 0 {
-		pageSize = 100
+	pageSizeInt := i.options.DuplicateIssuePageSize
+	if pageSizeInt <= 0 {
+		pageSizeInt = 100
 	}
-	maxPages := i.options.DuplicateIssueMaxPages
+	pageSize := int64(pageSizeInt)
+	maxPages := int64(i.options.DuplicateIssueMaxPages)
 
 	searchIn := "title"
 	searchState := "all"
-	page := 1
+	var page int64 = 1
 
 	for {
 		if maxPages > 0 && page > maxPages {
@@ -191,7 +192,7 @@ func (i *Integration) findIssueByTitle(title string) (*gitlab.Issue, error) {
 			}
 		}
 
-		if len(issues) < pageSize {
+		if int64(len(issues)) < pageSize {
 			return nil, nil
 		}
 

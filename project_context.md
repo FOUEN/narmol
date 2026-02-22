@@ -51,7 +51,7 @@ Los checks que no necesitan tool externa (git exposure, SSL/TLS, CORS, headers, 
 narmol/
 ├── main.go                     # Entrypoint
 ├── go.mod                      # module github.com/FOUEN/narmol
-├── go.work                     # Go Workspace (. + 8 tools)
+├── go.work                     # Go Workspace (. + 9 tools)
 ├── README.md
 ├── project_context.md          # ESTE FICHERO
 │
@@ -64,7 +64,7 @@ narmol/
 │   │
 │   ├── runner/
 │   │   ├── registry.go         # Tool struct, Register(), Get(), List() (sorted)
-│   │   └── tools.go            # init() registra 7 tools
+│   │   └── tools.go            # init() registra 8 tools
 │   │
 │   ├── scope/
 │   │   └── scope.go            # Scope struct, Load(), IsInScope(), FilterHosts(), Domains()
@@ -76,8 +76,12 @@ narmol/
 │   │
 │   └── workflows/
 │       ├── registry.go         # Workflow interface, OutputOptions, Register(), Get(), List() (sorted)
-│       └── active/
-│           └── active.go       # ActiveWorkflow — subfinder→httpx (InputTargetHost, cross-platform)
+│       ├── active/
+│       │   └── active.go       # ActiveWorkflow — subfinder→httpx (InputTargetHost, cross-platform)
+│       ├── recon/
+│       │   └── recon.go        # ReconWorkflow — subfinder(+recursive)+gau, pasivo
+│       └── secrets/
+│           └── secrets.go      # SecretsWorkflow — TruffleHog secret scanning (git repos, filesystem)
 │
 └── tools/                      # Repos clonados y parcheados (gestionados por narmol update)
     ├── dnsx/
@@ -87,6 +91,7 @@ narmol/
     ├── naabu/
     ├── nuclei/
     ├── subfinder/
+    ├── trufflehog/
     └── wappalyzergo/
 ```
 
@@ -104,7 +109,7 @@ go run . update
 
 `go run . update` ejecuta:
 1. Detecta que estamos en el source dir
-2. `UpdateAll()`: clona/actualiza los 8 repos en `tools/`, parchea main→Main
+2. `UpdateAll()`: clona/actualiza los 9 repos en `tools/`, parchea main→Main
 3. `rebuildAndReplace()`: compila el binario completo
 4. Detecta que se ejecutó via `go run` (path temporal) → instala en `$GOBIN` o `~/go/bin`
 
@@ -123,6 +128,8 @@ import (
 	"github.com/FOUEN/narmol/internal/cli"
 	_ "github.com/FOUEN/narmol/internal/runner"
 	_ "github.com/FOUEN/narmol/internal/workflows/active"
+	_ "github.com/FOUEN/narmol/internal/workflows/recon"
+	_ "github.com/FOUEN/narmol/internal/workflows/secrets"
 )
 
 func main() { cli.Run() }
@@ -203,12 +210,12 @@ func List() []Tool                  // sorted alphabetically
 package runner
 
 import (
-	// ... 6 tool imports
+	// ... 8 tool imports (dnsx, gau, httpx, katana, naabu, nuclei, subfinder, trufflehog)
 )
 
 func init() {
 	Register(Tool{Name: "nuclei", Main: nuclei_cmd.Main})
-	// ... 5 more (dnsx, gau, httpx, katana, subfinder)
+	// ... 7 more (dnsx, gau, httpx, katana, naabu, subfinder, trufflehog)
 }
 ```
 
@@ -218,13 +225,31 @@ func init() {
 
 API pública:
 - `Load(input string) (*Scope, error)` — fichero o string comma-separated
-- `IsInScope(target string) bool` — strip proto/port/path, exclusiones ganan
+- `IsInScope(target string) bool` — strip proto/port/path, exclusiones ganan. Soporta dominios, IPs, CIDRs
 - `FilterHosts(hosts []string) []string` — filtro batch
-- `Domains() []string` — `*.example.com` → `example.com`
-- `HasWildcard(target string) bool` — necesario para enumeración
-- `String() string`
+- `Domains() []string` — `*.example.com` → `example.com` (excluye IPs/CIDRs)
+- `IPs() []string` — devuelve todas las IPs y CIDRs del scope
+- `HasWildcard(target string) bool` — necesario para decidir si ejecutar subfinder
+- `HasIPs() bool` — indica si hay IPs/CIDRs en scope
+- `String() string` — representación legible con labels (domain/ip/cidr)
 
-Matching: `*.example.com` matchea root + cualquier subdomain. Case-insensitive.
+Struct `rule` interno:
+```go
+type rule struct {
+    pattern string     // "*.example.com", "10.0.0.1", "192.168.1.0/24"
+    exclude bool       // true si prefijo "-"
+    ip      net.IP     // non-nil si es IP individual
+    cidr    *net.IPNet // non-nil si es rango CIDR
+}
+```
+
+Matching:
+- `*.example.com` matchea root + cualquier subdomain a cualquier profundidad
+- IPs: comparación exacta con `net.IP.Equal()`
+- CIDRs: `net.IPNet.Contains()` comprueba si el target IP cae en el rango
+- URLs: se stripea protocolo, puerto y path antes de matchear
+- Exclusiones SIEMPRE ganan sobre inclusiones
+- Case-insensitive para dominios
 
 ---
 
@@ -239,7 +264,7 @@ type ToolSource struct {
 	ExtraFiles []string
 }
 
-func DefaultTools() []ToolSource { /* 7 entries */ }
+func DefaultTools() []ToolSource { /* 9 entries (incl. naabu, trufflehog) */ }
 func UpdateAll(baseDir string)   { /* clone/pull + patch + nuclei test cleanup */ }
 ```
 
@@ -287,18 +312,141 @@ func List() []Workflow  // sorted alphabetically
 
 ### 5.13 `internal/workflows/active/active.go`
 
-Workflow en 2 pasos (cross-platform, no usa FIFO):
+Workflow en 2 pasos (cross-platform, no usa FIFO). **Requiere wildcard scope.**
 
-1. **Subfinder**: descubre subdominios usando `ResultCallback`, filtra por scope, acumula hosts en slice
-2. **httpx**: recibe hosts via `InputTargetHost` (goflags.StringSlice), probes con OnResult callback
+**Pipeline:**
+1. **Subfinder**: descubre subdominios usando `ResultCallback`, filtra cada host contra scope, acumula hosts en slice
+2. **httpx**: recibe hosts via `InputTargetHost` (goflags.StringSlice), probes con `OnResult` callback
+
+**Comportamiento:**
+- Si scope no tiene wildcard para el dominio → error (no tiene sentido enumerar un solo host)
+- Subfinder: `MaxEnumerationTime: 10`, `Threads: 10`, `DisableUpdateCheck: true`, output a `io.Discard`
+- httpx: `Threads: 50`, `Timeout: 10`, `FollowRedirects: true`, `MaxRedirects: 10`, `RateLimit: 150`, `RandomAgent: true`, `TechDetect: true`, `OutputCDN: true`, `ExtractTitle: true`
+- Cada resultado httpx se compacta a `activeResult` con solo los campos relevantes
 
 Imports clave:
 - `httpx_runner "github.com/projectdiscovery/httpx/runner"`
 - `subfinder_runner "github.com/projectdiscovery/subfinder/v2/pkg/runner"`
 
-Struct `activeResult`: URL, Input, Host, Port, Scheme, StatusCode, Title, Webserver, Tech, CDN, CDNName.
+Struct `activeResult`:
+```go
+type activeResult struct {
+    URL, Input, Host, Port, Scheme string
+    StatusCode int
+    Title, Webserver string
+    Tech []string
+    CDN bool
+    CDNName string
+}
+```
 
-Funciones auxiliares: `compactFromResult()`, `compactResult()`, `jsonGetString()`.
+---
+
+### 5.14 `internal/workflows/recon/recon.go`
+
+Workflow de reconocimiento pasivo — **NUNCA toca el target directamente**. Solo consulta fuentes externas.
+
+**Pipeline:**
+1. **Subfinder** (solo si wildcard scope) — enumeración pasiva de subdominios
+2. **Subfinder recursivo** — alimenta los subdominios descubiertos de vuelta para encontrar niveles más profundos (e.g. `sub.sub.example.com`). Solo recurre en subdominios con ≥2 puntos. Timeout más corto (`MaxEnumerationTime: 5`).
+3. **Gau** — recolecta URLs históricas de Wayback Machine, Common Crawl, OTX, URLScan
+
+**Comportamiento:**
+- Si scope tiene wildcard (`*.example.com`): ejecuta los 3 pasos
+- Si scope es exacto (`example.com`): skip subfinder, solo gau. Emite el dominio como subdomain result de tipo "scope".
+- Dedup global: `sync.Map` evita duplicados entre todos los pasos
+- Scope filter en cada callback antes de emitir resultado
+- Contadores atómicos (`sync/atomic`) para subdomainCount y urlCount
+
+**Configuración gau:**
+```go
+config := &gau_providers.Config{
+    Threads: 5, Timeout: 45, MaxRetries: 3,
+    IncludeSubdomains: true,
+    Client: &fasthttp.Client{
+        TLSConfig: &tls.Config{InsecureSkipVerify: true},
+    },
+    Blacklist: mapset.NewThreadUnsafeSet(""), // REQUERIDO — si nil, panic
+}
+```
+**IMPORTANTE:** El `Client` de fasthttp y el `Blacklist` mapset DEBEN inicializarse explícitamente. Si `Client` es nil → nil pointer panic. Si `Blacklist` es nil → panic en provider.
+
+Imports clave:
+- `gau_providers "github.com/lc/gau/v2/pkg/providers"`
+- `gau_runner "github.com/lc/gau/v2/runner"`
+- `subfinder_runner "github.com/projectdiscovery/subfinder/v2/pkg/runner"`
+- `"github.com/valyala/fasthttp"`, `mapset "github.com/deckarep/golang-set/v2"`
+
+Struct `reconResult`:
+```go
+type reconResult struct {
+    Type   string `json:"type"`    // "subdomain", "url"
+    Value  string `json:"value"`   // el subdomain o URL
+    Source string `json:"source"`  // "subfinder", "subfinder-recursive", "gau", "scope"
+    Domain string `json:"domain"`  // dominio padre
+}
+```
+
+Funciones internas: `runSubfinder()`, `runSubfinderRecursive()`, `runGau()`
+
+---
+
+### 5.15 `internal/workflows/secrets/secrets.go`
+
+Workflow de escaneo de secretos usando TruffleHog — 800+ detectores para API keys, tokens, passwords, credenciales cloud, etc.
+
+**Pipeline:**
+1. **Auto-detección de tipo de scan** según el target:
+   - URLs (`https://`, `git@`, `*.git`) → scan de repositorio git
+   - Paths (`/`, `./`, `C:\`, `~`) → scan de filesystem
+   - Otros → intenta como git por defecto
+2. **TruffleHog engine** — crea `engine.Engine` con `sources.SourceManager`, ejecuta scan, recolecta resultados
+
+**Configuración del engine:**
+```go
+sourceMgr := sources.NewManager(
+    sources.WithConcurrentSources(1),
+    sources.WithConcurrentTargets(4),
+    sources.WithSourceUnits(),
+)
+eng, _ := engine.NewEngine(ctx, &engine.Config{
+    Concurrency:   4,
+    Verify:        false,  // no verificar contra APIs (más rápido)
+    SourceManager: sourceMgr,
+})
+```
+
+**Patrón de ejecución:**
+1. `eng.Start(ctx)` — arranca workers (scanner, detector, notifier)
+2. `eng.ScanGit(ctx, config)` o `eng.ScanFileSystem(ctx, config)` — inicia scan asíncrono
+3. Goroutine consume `eng.ResultsChan()` — convierte `detectors.ResultWithMetadata` → `secretResult`
+4. `eng.Finish(ctx)` — espera a que terminen todos los workers
+
+**API pública** (para uso desde otros workflows):
+- `ScanGitRepo(url string) ([]secretResult, error)` — escanea repo git y devuelve resultados
+- `ScanPath(path string) ([]secretResult, error)` — escanea directorio local y devuelve resultados
+
+Imports clave:
+- `"github.com/trufflesecurity/trufflehog/v3/pkg/engine"`
+- `"github.com/trufflesecurity/trufflehog/v3/pkg/sources"`
+- `"github.com/trufflesecurity/trufflehog/v3/pkg/detectors"`
+- `"github.com/trufflesecurity/trufflehog/v3/pkg/context"`
+
+Struct `secretResult`:
+```go
+type secretResult struct {
+    Type         string            `json:"type"`          // siempre "secret"
+    DetectorType string            `json:"detector_type"` // "AWS", "GitHub", "Slack", etc.
+    Verified     bool              `json:"verified"`
+    Redacted     string            `json:"redacted"`      // versión redactada del secreto
+    Source       string            `json:"source"`        // "git" o "filesystem"
+    Target       string            `json:"target"`        // URL del repo o path
+    SourceName   string            `json:"source_name"`
+    ExtraData    map[string]string `json:"extra_data,omitempty"`
+}
+```
+
+Funciones internas: `scanGit()`, `scanFilesystem()`, `resultToSecret()`, `determineScanType()`
 
 ---
 
@@ -307,8 +455,10 @@ Funciones auxiliares: `compactFromResult()`, `compactResult()`, `jsonGetString()
 ```
 main.go
   ├── internal/cli
-  ├── internal/runner          (_)
-  └── internal/workflows/active (_)
+  ├── internal/runner           (_)
+  ├── internal/workflows/active  (_)
+  ├── internal/workflows/recon   (_)
+  └── internal/workflows/secrets (_)
 
 internal/cli
   ├── internal/runner
@@ -320,6 +470,16 @@ internal/workflows/active
   ├── internal/scope
   ├── internal/workflows
   └── httpx/subfinder runners (external)
+
+internal/workflows/recon
+  ├── internal/scope
+  ├── internal/workflows
+  └── gau/subfinder runners (external)
+
+internal/workflows/secrets
+  ├── internal/scope
+  ├── internal/workflows
+  └── trufflehog engine/sources/detectors (external)
 
 internal/updater → solo stdlib + exec(git, go build)  ← ÚNICO uso válido de os/exec en todo narmol
 internal/scope   → solo stdlib
@@ -382,7 +542,6 @@ No toca el target directamente. Solo fuentes externas.
 - [x] Scope filter en cada paso
 - [x] Dedup global de resultados
 - [x] Output JSON: subdominios + URLs históricas (tipo, valor, fuente, dominio)
-- [ ] Output JSON: subdominios + URLs históricas
 
 #### `web` — Reconocimiento web activo
 
@@ -393,9 +552,10 @@ Toca el target. Cubre descubrimiento, depuración de superficie, y fingerprintin
 - [ ] Alive check — hosts con servicio web (httpx)
 - [ ] Tech detection en hosts alive (wappalyzergo)
 - [ ] DNS takeover check (CNAME → dominio inexistente/disponible)
-- [ ] Git exposure check (`/.git/HEAD` accesible)
+- [ ] Git exposure check (`/.git/HEAD` accesible) → si expuesto, scan con TruffleHog
 - [ ] Crawling de hosts alive (katana: robots.txt, sitemap, links)
 - [ ] Extracción de endpoints y parámetros desde JavaScript
+- [ ] Secret scanning con TruffleHog en contenido crawleado (JS, respuestas)
 - [ ] Scope filter en cada paso
 - [ ] Output JSON: subdominios, hosts alive, tecnologías, URLs crawleadas, findings
 
@@ -409,6 +569,7 @@ Input: output del workflow `web` (hosts alive + URLs).
 - [ ] Cookie flags check (HttpOnly, Secure, SameSite)
 - [ ] SSL/TLS config check (versión protocolo, ciphers, expiración certificado)
 - [ ] Open redirect check básico
+- [ ] Secret scanning con TruffleHog (git repos expuestos, respuestas)
 - [ ] Scope filter en cada paso
 - [ ] Output JSON: vulnerabilidades categorizadas por severidad
 
@@ -420,6 +581,7 @@ Orquesta todos los core workflows + soporte de IPs/CIDR.
 - [ ] Ejecutar `recon`
 - [ ] Ejecutar `web`
 - [ ] Ejecutar `vulnscan`
+- [ ] Secret scanning con TruffleHog (git repos, filesystem, crawled content)
 - [ ] Port scan en IPs/CIDR del scope (si aplica)
 - [ ] Output JSON unificado: superficie completa + vulnerabilidades
 
@@ -498,10 +660,21 @@ Detección de subdomain takeover.
 - [ ] Check si el CNAME apunta a servicio abandonado (S3, GitHub Pages, Heroku, etc.)
 - [ ] Output: subdominios vulnerables + servicio
 
+#### `secrets` ✅ (implementado)
+
+Escaneo de secretos filtrados usando TruffleHog (800+ detectores).
+
+- [x] Scan de repositorios git (por URL) para secretos
+- [x] Scan de filesystem/directorio local para secretos
+- [x] 800+ detectores (API keys, tokens, passwords, AWS, GCP, etc.)
+- [x] Output JSON: tipo detector, verificado, redactado, fuente
+- [x] API pública (`ScanGitRepo()`, `ScanPath()`) para uso desde otros workflows
+
 #### `gitexpose`
 
-Detección de repositorios git expuestos.
+Detección de repositorios git expuestos + escaneo de secretos.
 
 - [ ] Input: lista de URLs alive
 - [ ] Check `/.git/HEAD`, `/.git/config`
-- [ ] Output: hosts con git expuesto
+- [ ] Si `.git` expuesto → scan con TruffleHog para secretos
+- [ ] Output: hosts con git expuesto + secretos encontrados

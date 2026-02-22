@@ -28,6 +28,7 @@ func DefaultTools() []ToolSource {
 		{Name: "naabu", URL: "https://github.com/projectdiscovery/naabu", PkgName: "naabu", MainFile: "cmd/naabu/main.go"},
 		{Name: "nuclei", URL: "https://github.com/projectdiscovery/nuclei", PkgName: "nuclei", MainFile: "cmd/nuclei/main.go"},
 		{Name: "subfinder", URL: "https://github.com/projectdiscovery/subfinder", PkgName: "subfinder", MainFile: "cmd/subfinder/main.go"},
+		{Name: "trufflehog", URL: "https://github.com/trufflesecurity/trufflehog", PkgName: "trufflehog", MainFile: "main.go"},
 		{Name: "wappalyzergo", URL: "https://github.com/projectdiscovery/wappalyzergo"},
 	}
 }

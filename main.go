@@ -7,6 +7,7 @@ import (
 	_ "github.com/FOUEN/narmol/internal/runner"
 	_ "github.com/FOUEN/narmol/internal/workflows/active"
 	_ "github.com/FOUEN/narmol/internal/workflows/recon"
+	_ "github.com/FOUEN/narmol/internal/workflows/secrets"
 )
 
 func main() {

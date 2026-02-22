@@ -9,5 +9,6 @@ use (
 	./tools/naabu
 	./tools/nuclei
 	./tools/subfinder
+	./tools/trufflehog
 	./tools/wappalyzergo
 )

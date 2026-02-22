@@ -8,6 +8,7 @@ import (
 	naabu_cmd "github.com/projectdiscovery/naabu/v2/cmd/naabu"
 	nuclei_cmd "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"
 	subfinder_cmd "github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
+	trufflehog_cmd "github.com/trufflesecurity/trufflehog/v3"
 )
 
 func init() {
@@ -18,4 +19,5 @@ func init() {
 	Register(Tool{Name: "naabu", Description: "Run naabu port scanner", Main: naabu_cmd.Main})
 	Register(Tool{Name: "subfinder", Description: "Run subfinder enumerator", Main: subfinder_cmd.Main})
 	Register(Tool{Name: "gau", Description: "Run gau URL fetcher", Main: gau_cmd.Main})
+	Register(Tool{Name: "trufflehog", Description: "Run trufflehog secret scanner", Main: trufflehog_cmd.Main})
 }
