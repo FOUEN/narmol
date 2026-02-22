@@ -11,8 +11,9 @@ import (
 	"syscall"
 )
 
-func initCmd(p string) *exec.Cmd {
-	cmd := exec.Command("nohup", p, "engine")
+func initCmd(p string, args []string) *exec.Cmd {
+	cmdArgs := append([]string{p}, args...)
+	cmd := exec.Command("nohup", cmdArgs...)
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,

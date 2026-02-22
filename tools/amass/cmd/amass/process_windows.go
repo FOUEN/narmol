@@ -11,8 +11,9 @@ import (
 	"syscall"
 )
 
-func initCmd(p string) *exec.Cmd {
-	cmd := exec.Command("cmd", "/C", "start", p, "engine")
+func initCmd(p string, args []string) *exec.Cmd {
+	cmdArgs := append([]string{"/C", "start", p}, args...)
+	cmd := exec.Command("cmd", cmdArgs...)
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
