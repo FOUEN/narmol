@@ -2,6 +2,7 @@ package recon
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,8 +14,10 @@ import (
 	"github.com/FOUEN/narmol/internal/scope"
 	"github.com/FOUEN/narmol/internal/workflows"
 
+	mapset "github.com/deckarep/golang-set/v2"
 	gau_providers "github.com/lc/gau/v2/pkg/providers"
 	gau_runner "github.com/lc/gau/v2/runner"
+	"github.com/valyala/fasthttp"
 
 	"github.com/projectdiscovery/goflags"
 	"github.com/projectdiscovery/subfinder/v2/pkg/resolve"
@@ -234,10 +237,16 @@ func (w *ReconWorkflow) runGau(domain string, s *scope.Scope, emitUnique func(re
 
 	config := &gau_providers.Config{
 		Threads:           5,
-		Timeout:           30,
+		Timeout:           45,
 		MaxRetries:        3,
 		IncludeSubdomains: true,
 		RemoveParameters:  false,
+		Client: &fasthttp.Client{
+			TLSConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+		Blacklist: mapset.NewThreadUnsafeSet(""),
 	}
 
 	providerNames := []string{"wayback", "commoncrawl", "otx", "urlscan"}
