@@ -459,47 +459,43 @@ Funciones internas: `scanGit()`, `scanFilesystem()`, `resultToSecret()`, `determ
 
 ### 5.16 `internal/workflows/web/web.go`
 
-Workflow de auditoría web completa — **Toca el target activamente**. Pipeline de 4 pasos.
+Workflow de auditoría web estilo Nessus — **fingerprint primero, scan después**. Solo ejecuta templates relevantes al stack detectado.
 
-**Pipeline:**
+**Pipeline (3 pasos):**
 1. **Subfinder** (solo si wildcard scope) — enumeración pasiva de subdominios + siempre incluye el dominio raíz
-2. **httpx** — probing de hosts vivos con tech detection, CDN, title extraction
-3. **Katana** — crawling de hosts vivos (depth 3, JS scraping, ignora query params, field scope `rdn`)
-4. **Nuclei** — vulnerabilities scan en la unión de hosts vivos + endpoints crawleados (severity: medium, high, critical)
+2. **httpx** — probing + fingerprinting: tech detection (wappalyzer), web server, CDN, title
+3. **Nuclei** — vulnerability scan **filtrado por tags** derivados del fingerprint de httpx
+
+**Optimización estilo Nessus:**
+- httpx detecta tecnologías → se mapean a nuclei tags via `techTagMap`
+- Ejemplo: httpx detecta "WordPress" + "nginx" → nuclei carga solo templates con tags `wordpress`, `wp`, `wp-plugin`, `wp-theme`, `nginx`
+- Tags genéricos siempre activos: `exposure`, `misconfig`, `default-login`, `takeover`, `config`
+- Resultado: en vez de cargar 10k+ templates, solo se cargan los relevantes al stack
+- WebServer header se parsea para extraer el nombre base ("nginx/1.19.0" → "nginx")
 
 **Comportamiento:**
-- Si no hay live hosts tras httpx → early stop (no ejecuta katana ni nuclei)
-- Nuclei recibe `mergeUnique(liveHosts, endpoints)` como targets
+- Si no hay live hosts tras httpx → early stop
 - Dedup global por fase con `sync.Map` (key = `phase:value`)
-- Scope filter en subfinder callback y katana callback
-- Contadores atómicos (`sync/atomic`) para estadísticas
+- Scope filter en subfinder callback
+- Resultados se emiten en streaming conforme se descubren
 
 **Configuración httpx:**
 ```go
 Threads: 50, Timeout: 10, FollowRedirects: true, MaxRedirects: 10,
 RateLimit: 150, RandomAgent: true, TechDetect: true, OutputCDN: "true", ExtractTitle: true
+// Retorna: ([]string liveHosts, map[string]struct{} techSet)
 ```
 
-**Configuración katana (API pública, NO internal/runner):**
+**Configuración nuclei (SDK lib):**
 ```go
-katana_types.NewCrawlerOptions(opts) → katana_standard.New(crawlerOptions) → crawler.Crawl(host)
-MaxDepth: 3, RateLimit: 150, Concurrency: 10, Parallelism: 10,
-Strategy: katana_queue.DepthFirst.String(), FieldScope: "rdn",
-ScrapeJSResponses: true, IgnoreQueryParams: true
-```
-
-**Configuración nuclei (SDK lib, NO cmd):**
-```go
-nuclei.NewNucleiEngineCtx(ctx, opts...) → ne.LoadAllTemplates() → ne.LoadTargets() → ne.ExecuteCallbackWithCtx()
-Severity: "medium,high,critical", TemplateConcurrency: 25, HostConcurrency: 25, ProbeConcurrency: 50
+nuclei.WithTemplateFilters(nuclei.TemplateFilters{
+    Severity: "medium,high,critical",
+    Tags:     tags, // computed from buildNucleiTags(techSet)
+})
 ```
 
 Imports clave:
 - `httpx_runner "github.com/projectdiscovery/httpx/runner"`
-- `katana_standard "github.com/projectdiscovery/katana/pkg/engine/standard"`
-- `katana_types "github.com/projectdiscovery/katana/pkg/types"`
-- `katana_queue "github.com/projectdiscovery/katana/pkg/utils/queue"`
-- `katana_output "github.com/projectdiscovery/katana/pkg/output"`
 - `nuclei "github.com/projectdiscovery/nuclei/v3/lib"`
 - `nuclei_output "github.com/projectdiscovery/nuclei/v3/pkg/output"`
 - `subfinder_runner "github.com/projectdiscovery/subfinder/v2/pkg/runner"`
@@ -507,7 +503,7 @@ Imports clave:
 Struct `webResult`:
 ```go
 type webResult struct {
-    Phase      string   `json:"phase"`                 // "probe", "crawl", "vuln"
+    Phase      string   `json:"phase"`                 // "probe", "vuln"
     Value      string   `json:"value"`                 // URL or matched-at
     Host       string   `json:"host,omitempty"`
     StatusCode int      `json:"status_code,omitempty"`
@@ -523,7 +519,9 @@ type webResult struct {
 }
 ```
 
-Funciones internas: `runSubfinder()`, `runHttpx()`, `runKatana()`, `runNuclei()`, `appendUnique()`, `mergeUnique()`
+Funciones: `runSubfinder()`, `runHttpx()`, `runNuclei()`, `buildNucleiTags()`, `appendUnique()`
+
+Variables globales: `alwaysTags` (generic check categories), `techTagMap` (wappalyzer → nuclei tag mapping, 50+ entries)
 
 ---
 
@@ -562,7 +560,7 @@ internal/workflows/secrets
 internal/workflows/web
   ├── internal/scope
   ├── internal/workflows
-  └── subfinder/httpx/katana/nuclei runners (external)
+  └── subfinder/httpx/nuclei runners (external)
 
 internal/updater → solo stdlib + exec(git, go build)  ← ÚNICO uso válido de os/exec en todo narmol
 internal/scope   → solo stdlib
@@ -626,18 +624,19 @@ No toca el target directamente. Solo fuentes externas.
 - [x] Dedup global de resultados
 - [x] Output JSON: subdominios + URLs históricas (tipo, valor, fuente, dominio)
 
-#### `web` ✅ (implementado) — Full web audit
+#### `web` ✅ (implementado) — Full web audit (estilo Nessus)
 
-Toca el target. Pipeline completo: subfinder→httpx→katana→nuclei.
+Fingerprint first, scan after. Pipeline: subfinder→httpx(fingerprint)→nuclei(targeted).
 
 - [x] Subdomain discovery (subfinder) — solo si scope tiene wildcard
-- [x] Alive check — hosts con servicio web (httpx), tech detection, CDN, title
-- [x] Crawling de hosts alive (katana: depth 3, JS scraping, query param dedup, field scope `rdn`)
-- [x] Vulnerability scan (nuclei: severity medium,high,critical)
+- [x] Alive check + fingerprinting (httpx): tech detection, CDN, title, webserver
+- [x] Tech → nuclei tag mapping (techTagMap: 50+ entries, wappalyzer → nuclei tags)
+- [x] Targeted vulnerability scan (nuclei: solo templates del stack detectado)
+- [x] Generic checks siempre activos: exposure, misconfig, default-login, takeover, config
 - [x] Scope filter en cada paso
 - [x] Early stop si no hay live hosts
 - [x] Dedup global por fase
-- [x] Output JSON: probe (live hosts), crawl (endpoints), vuln (vulnerabilidades)
+- [x] Output JSON: probe (live hosts + tech) + vuln (vulnerabilidades filtradas por stack)
 
 #### `vulnscan` — Assessment de vulnerabilidades
 

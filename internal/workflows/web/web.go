@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,10 +16,6 @@ import (
 
 	"github.com/projectdiscovery/goflags"
 	httpx_runner "github.com/projectdiscovery/httpx/runner"
-	katana_standard "github.com/projectdiscovery/katana/pkg/engine/standard"
-	katana_output "github.com/projectdiscovery/katana/pkg/output"
-	katana_types "github.com/projectdiscovery/katana/pkg/types"
-	katana_queue "github.com/projectdiscovery/katana/pkg/utils/queue"
 	nuclei "github.com/projectdiscovery/nuclei/v3/lib"
 	nuclei_output "github.com/projectdiscovery/nuclei/v3/pkg/output"
 	"github.com/projectdiscovery/subfinder/v2/pkg/resolve"
@@ -30,18 +26,18 @@ func init() {
 	workflows.Register(&WebWorkflow{})
 }
 
-// WebWorkflow performs full web application reconnaissance and vulnerability scanning.
+// WebWorkflow performs web audit using a Nessus-style approach:
+// fingerprint first, then run only vulnerability checks relevant to the detected stack.
 // Pipeline:
 //  1. subfinder   — discover subdomains (if wildcard scope)
-//  2. httpx       — probe live hosts, detect technologies, extract titles
-//  3. katana      — crawl live hosts to find endpoints, forms, JS files
-//  4. nuclei      — scan all discovered URLs for vulnerabilities
+//  2. httpx       — probe + fingerprint (tech detection, server, CDN)
+//  3. nuclei      — targeted vuln scan (templates filtered by detected technologies)
 type WebWorkflow struct{}
 
 func (w *WebWorkflow) Name() string { return "web" }
 
 func (w *WebWorkflow) Description() string {
-	return "Full web audit: subdomain discovery → live probe → crawling → vulnerability scan."
+	return "Web audit: discovery → fingerprint → targeted vuln scan (Nessus-style)."
 }
 
 func (w *WebWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOptions) error {
@@ -101,26 +97,22 @@ func (w *WebWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOp
 
 	fmt.Printf("[+] %d hosts to probe\n", len(hosts))
 
-	// ── Step 2: httpx — probe live hosts ──────────────────────────────
-	liveHosts := w.runHttpx(hosts, s, emitUnique)
+	// ── Step 2: httpx — probe + fingerprint ───────────────────────────
+	liveHosts, techSet := w.runHttpx(hosts, s, emitUnique)
 
 	if len(liveHosts) == 0 {
 		fmt.Println("[!] No live hosts found — stopping workflow")
 		return nil
 	}
-	fmt.Printf("[+] %d live hosts found\n", len(liveHosts))
+	fmt.Printf("[+] %d live hosts found, %d unique technologies detected\n", len(liveHosts), len(techSet))
 
-	// ── Step 3: katana — crawl live hosts ─────────────────────────────
-	endpoints := w.runKatana(liveHosts, s, emitUnique)
-	_ = endpoints // crawled endpoints are emitted for output but nuclei only needs base hosts
+	// ── Step 3: nuclei — targeted vulnerability scan ──────────────────
+	// Nessus-style: use fingerprint to select only relevant templates.
+	// Instead of running all 10k+ templates, we filter by detected tech stack.
+	tags := buildNucleiTags(techSet)
+	fmt.Printf("[+] Nuclei tags from fingerprint: %s\n", strings.Join(tags, ", "))
 
-	// Nuclei templates already contain the paths to probe (/.env, /wp-admin/, etc.)
-	// Passing all crawled endpoints (JS, CSS, images, API paths) would multiply
-	// scan time by orders of magnitude for no real gain.
-	fmt.Printf("[+] %d live hosts as nuclei targets (crawled %d endpoints)\n", len(liveHosts), len(endpoints))
-
-	// ── Step 4: nuclei — vulnerability scan ───────────────────────────
-	vulnCount := w.runNuclei(liveHosts, emitUnique)
+	vulnCount := w.runNuclei(liveHosts, tags, emitUnique)
 
 	// ── Summary ───────────────────────────────────────────────────────
 	if opts.TextFile != "" {
@@ -129,8 +121,8 @@ func (w *WebWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOp
 	if opts.JSONFile != "" {
 		fmt.Printf("[+] JSON results saved to: %s\n", opts.JSONFile)
 	}
-	fmt.Printf("[+] Workflow 'web' completed — %d live, %d endpoints, %d vulns\n",
-		len(liveHosts), len(endpoints), vulnCount)
+	fmt.Printf("[+] Workflow 'web' completed — %d live, %d techs, %d vulns\n",
+		len(liveHosts), len(techSet), vulnCount)
 	return nil
 }
 
@@ -178,11 +170,12 @@ func (w *WebWorkflow) runSubfinder(domain string, s *scope.Scope) []string {
 
 // ─── Step 2: httpx ──────────────────────────────────────────────────────
 
-func (w *WebWorkflow) runHttpx(hosts []string, s *scope.Scope, emitUnique func(webResult) bool) []string {
+func (w *WebWorkflow) runHttpx(hosts []string, s *scope.Scope, emitUnique func(webResult) bool) ([]string, map[string]struct{}) {
 	fmt.Printf("[*] Probing %d hosts with httpx...\n", len(hosts))
 
 	var mu sync.Mutex
 	var liveHosts []string
+	techSet := make(map[string]struct{})
 
 	hxOptions := &httpx_runner.Options{
 		InputTargetHost:    goflags.StringSlice(hosts),
@@ -221,96 +214,39 @@ func (w *WebWorkflow) runHttpx(hosts []string, s *scope.Scope, emitUnique func(w
 
 			mu.Lock()
 			liveHosts = append(liveHosts, r.URL)
+			for _, t := range r.Technologies {
+				techSet[strings.ToLower(t)] = struct{}{}
+			}
+			if r.WebServer != "" {
+				// Extract base server name (e.g. "nginx" from "nginx/1.19.0")
+				ws := strings.ToLower(strings.Split(r.WebServer, "/")[0])
+				techSet[ws] = struct{}{}
+			}
 			mu.Unlock()
 		},
 	}
 
 	if err := hxOptions.ValidateOptions(); err != nil {
 		fmt.Printf("[!] httpx options error: %s\n", err)
-		return nil
+		return nil, techSet
 	}
 
 	hxRunner, err := httpx_runner.New(hxOptions)
 	if err != nil {
 		fmt.Printf("[!] Could not create httpx runner: %s\n", err)
-		return nil
+		return nil, techSet
 	}
 
 	hxRunner.RunEnumeration()
 	hxRunner.Close()
 
-	return liveHosts
+	return liveHosts, techSet
 }
 
-// ─── Step 3: Katana ─────────────────────────────────────────────────────
+// ─── Step 3: Nuclei (targeted by fingerprint) ───────────────────────────
 
-func (w *WebWorkflow) runKatana(liveHosts []string, s *scope.Scope, emitUnique func(webResult) bool) []string {
-	fmt.Printf("[*] Crawling %d live hosts with katana...\n", len(liveHosts))
-
-	var mu sync.Mutex
-	var endpoints []string
-
-	ktOptions := &katana_types.Options{
-		MaxDepth:           3,
-		BodyReadSize:       math.MaxInt,
-		Timeout:            10,
-		RateLimit:          150,
-		Concurrency:        10,
-		Parallelism:        10,
-		Strategy:           katana_queue.DepthFirst.String(),
-		FieldScope:         "rdn",
-		Silent:             true,
-		DisableUpdateCheck: true,
-		ScrapeJSResponses:  true,
-		IgnoreQueryParams:  true,
-		OnResult: func(r katana_output.Result) {
-			if r.Request == nil || r.Request.URL == "" {
-				return
-			}
-			u := r.Request.URL
-			if !s.IsInScope(u) {
-				return
-			}
-			if emitUnique(webResult{
-				Phase: "crawl",
-				Value: u,
-			}) {
-				mu.Lock()
-				endpoints = append(endpoints, u)
-				mu.Unlock()
-			}
-		},
-	}
-
-	crawlerOptions, err := katana_types.NewCrawlerOptions(ktOptions)
-	if err != nil {
-		fmt.Printf("[!] Could not create katana crawler options: %s\n", err)
-		return nil
-	}
-	defer crawlerOptions.Close()
-
-	crawler, err := katana_standard.New(crawlerOptions)
-	if err != nil {
-		fmt.Printf("[!] Could not create katana crawler: %s\n", err)
-		return nil
-	}
-	defer crawler.Close()
-
-	// Crawl each live host
-	for _, host := range liveHosts {
-		if err := crawler.Crawl(host); err != nil {
-			fmt.Printf("[!] Katana crawl error for %s: %s\n", host, err)
-		}
-	}
-
-	fmt.Printf("[+] Katana discovered %d unique endpoints\n", len(endpoints))
-	return endpoints
-}
-
-// ─── Step 4: Nuclei ─────────────────────────────────────────────────────
-
-func (w *WebWorkflow) runNuclei(targets []string, emitUnique func(webResult) bool) int64 {
-	fmt.Printf("[*] Scanning %d targets with nuclei...\n", len(targets))
+func (w *WebWorkflow) runNuclei(targets []string, tags []string, emitUnique func(webResult) bool) int64 {
+	fmt.Printf("[*] Scanning %d targets with nuclei (%d tech tags)...\n", len(targets), len(tags))
 
 	var vulnCount int64
 	ctx := context.Background()
@@ -318,6 +254,7 @@ func (w *WebWorkflow) runNuclei(targets []string, emitUnique func(webResult) boo
 	ne, err := nuclei.NewNucleiEngineCtx(ctx,
 		nuclei.WithTemplateFilters(nuclei.TemplateFilters{
 			Severity: "medium,high,critical",
+			Tags:     tags,
 		}),
 		nuclei.WithConcurrency(nuclei.Concurrency{
 			TemplateConcurrency:           25,
@@ -368,7 +305,7 @@ func (w *WebWorkflow) runNuclei(targets []string, emitUnique func(webResult) boo
 
 // webResult is the unified result type for all phases of the web workflow.
 type webResult struct {
-	Phase      string   `json:"phase"`                 // "probe", "crawl", "vuln"
+	Phase      string   `json:"phase"`                 // "probe", "vuln"
 	Value      string   `json:"value"`                 // URL or matched-at
 	Host       string   `json:"host,omitempty"`        // target host
 	StatusCode int      `json:"status_code,omitempty"` // HTTP status
@@ -395,8 +332,6 @@ func (r webResult) summary() string {
 			title = " - " + r.Title
 		}
 		return fmt.Sprintf("[LIVE] %s (%d)%s%s", r.Value, r.StatusCode, title, tech)
-	case "crawl":
-		return fmt.Sprintf("[ENDPOINT] %s", r.Value)
 	case "vuln":
 		return fmt.Sprintf("[%s] %s — %s (%s)", strings.ToUpper(r.Severity), r.Value, r.VulnName, r.TemplateID)
 	default:
@@ -413,4 +348,114 @@ func appendUnique(slice []string, item string) []string {
 		}
 	}
 	return append(slice, item)
+}
+
+// ─── Nessus-style fingerprint → tag mapping ───────────────────────────────
+
+// alwaysTags are generic check categories that always run regardless of tech stack.
+// Mirrors Nessus: exposed files, misconfigurations, default credentials.
+var alwaysTags = []string{
+	"exposure", "misconfig", "default-login", "takeover", "config",
+}
+
+// techTagMap maps wappalyzer technology names (lowercase) to nuclei template tags.
+// This is the core of the Nessus-style approach: fingerprint → relevant plugins only.
+var techTagMap = map[string][]string{
+	"wordpress":        {"wordpress", "wp", "wp-plugin", "wp-theme"},
+	"joomla":           {"joomla"},
+	"drupal":           {"drupal"},
+	"magento":          {"magento"},
+	"shopify":          {"shopify"},
+	"nginx":            {"nginx"},
+	"apache":           {"apache"},
+	"iis":              {"iis"},
+	"tomcat":           {"tomcat", "apache-tomcat"},
+	"lighttpd":         {"lighttpd"},
+	"caddy":            {"caddy"},
+	"php":              {"php"},
+	"java":             {"java"},
+	"asp.net":          {"asp", "aspx", "iis"},
+	"python":           {"python"},
+	"ruby":             {"ruby", "rails"},
+	"node.js":          {"nodejs"},
+	"jenkins":          {"jenkins"},
+	"jira":             {"jira", "atlassian"},
+	"confluence":       {"confluence", "atlassian"},
+	"bitbucket":        {"bitbucket", "atlassian"},
+	"gitlab":           {"gitlab"},
+	"grafana":          {"grafana"},
+	"kibana":           {"kibana", "elastic"},
+	"elasticsearch":    {"elasticsearch", "elastic"},
+	"spring":           {"spring", "springboot"},
+	"spring boot":      {"spring", "springboot"},
+	"laravel":          {"laravel", "php"},
+	"django":           {"django", "python"},
+	"flask":            {"flask", "python"},
+	"express":          {"express", "nodejs"},
+	"next.js":          {"nextjs", "nodejs"},
+	"nuxt.js":          {"nuxtjs", "nodejs"},
+	"react":            {"react"},
+	"angular":          {"angular"},
+	"vue.js":           {"vuejs"},
+	"cloudflare":       {"cloudflare"},
+	"varnish":          {"varnish"},
+	"docker":           {"docker"},
+	"kubernetes":       {"kubernetes", "k8s"},
+	"mongodb":          {"mongodb"},
+	"mysql":            {"mysql"},
+	"postgresql":       {"postgresql", "postgres"},
+	"redis":            {"redis"},
+	"rabbitmq":         {"rabbitmq"},
+	"apache solr":      {"solr", "apache"},
+	"apache struts":    {"struts", "apache"},
+	"apache airflow":   {"airflow", "apache"},
+	"sonarqube":        {"sonarqube"},
+	"moodle":           {"moodle"},
+	"phpmyadmin":       {"phpmyadmin", "php"},
+	"webmin":           {"webmin"},
+	"zimbra":           {"zimbra"},
+	"citrix":           {"citrix"},
+	"fortinet":         {"fortinet", "fortigate"},
+	"palo alto":        {"paloalto"},
+	"sonicwall":        {"sonicwall"},
+	"microsoft exchange": {"exchange", "microsoft"},
+	"microsoft sharepoint": {"sharepoint", "microsoft"},
+	"outlook":          {"outlook", "microsoft"},
+	"swagger":          {"swagger", "api"},
+	"graphql":          {"graphql", "api"},
+}
+
+// buildNucleiTags converts detected technologies into nuclei template tags.
+// This is the key optimization: instead of running all 10k+ templates, we only
+// run templates relevant to the detected stack + generic exposure/misconfig checks.
+func buildNucleiTags(techSet map[string]struct{}) []string {
+	tagSet := make(map[string]struct{})
+
+	// Always include generic check categories
+	for _, t := range alwaysTags {
+		tagSet[t] = struct{}{}
+	}
+
+	// Map detected techs to nuclei tags
+	for tech := range techSet {
+		tech = strings.ToLower(strings.TrimSpace(tech))
+		if tech == "" {
+			continue
+		}
+		if mapped, ok := techTagMap[tech]; ok {
+			for _, tag := range mapped {
+				tagSet[tag] = struct{}{}
+			}
+		} else {
+			// Direct mapping: use lowercased tech name as tag (many match directly)
+			tagSet[tech] = struct{}{}
+		}
+	}
+
+	tags := make([]string, 0, len(tagSet))
+	for t := range tagSet {
+		tags = append(tags, t)
+	}
+	sort.Strings(tags)
+	return tags
 }

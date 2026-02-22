@@ -115,7 +115,7 @@ narmol workflow active -s scope.txt -oj active.json
 
 ### `web` — Full Web Audit
 
-Complete web application audit pipeline: subdomain discovery, live probing, crawling, and vulnerability scanning.
+Complete web audit using a Nessus-style approach: fingerprint first, then run only relevant vulnerability checks.
 
 ```
 narmol workflow web -s scope.txt -oj web.json
@@ -123,21 +123,24 @@ narmol workflow web -s scope.txt -oj web.json
 
 **Pipeline:**
 
-1. **Subfinder** — discovers subdomains (only if scope has wildcard `*.example.com`), always includes the root domain
-2. **httpx** — probes all hosts for live web services (tech detection, CDN detection, title extraction)
-3. **Katana** — crawls live hosts (depth 3, JS scraping, query param dedup, field scope `rdn`)
-4. **Nuclei** — scans all discovered URLs for vulnerabilities (severity: medium, high, critical)
+1. **Subfinder** — discovers subdomains (only if scope has wildcard `*.example.com`)
+2. **httpx** — probes all hosts for live web services + **fingerprints the tech stack** (technologies, server, CDN)
+3. **Nuclei** — targeted vulnerability scan using **only templates matching the detected technologies**
+
+**Nessus-style optimization:**
+- httpx detects technologies (e.g. nginx, WordPress, PHP) via wappalyzer
+- Detected tech is mapped to nuclei template tags (e.g. "wordpress" → `wordpress`, `wp`, `wp-plugin`)
+- Generic checks always run: `exposure`, `misconfig`, `default-login`, `takeover`, `config`
+- Instead of running all 10,000+ nuclei templates, only relevant ones are loaded
 
 **Behavior:**
-- Stops early if no live hosts are found after httpx
-- Nuclei receives the union of live hosts + crawled endpoints
-- Global deduplication per phase
+- Stops early if no live hosts found after httpx
+- Results stream in real-time as they are discovered
 - Every result is scope-filtered
 
 **JSON output:**
 ```json
-{"phase":"probe","value":"https://api.example.com","host":"api.example.com","status_code":200,"title":"API","tech":["nginx"],"cdn":false}
-{"phase":"crawl","value":"https://api.example.com/v1/users"}
+{"phase":"probe","value":"https://api.example.com","host":"api.example.com","status_code":200,"title":"API","tech":["nginx","PHP"],"cdn":false}
 {"phase":"vuln","value":"https://api.example.com","host":"api.example.com","template_id":"cve-2024-1234","vuln_name":"RCE via X","severity":"critical"}
 ```
 
