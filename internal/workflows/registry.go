@@ -2,6 +2,7 @@ package workflows
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/FOUEN/narmol/internal/scope"
 )
@@ -39,11 +40,14 @@ func Get(name string) (Workflow, error) {
 	return w, nil
 }
 
-// List returns all registered workflow names and descriptions.
+// List returns all registered workflows sorted alphabetically.
 func List() []Workflow {
 	list := make([]Workflow, 0, len(registry))
 	for _, w := range registry {
 		list = append(list, w)
 	}
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].Name() < list[j].Name()
+	})
 	return list
 }

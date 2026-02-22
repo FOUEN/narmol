@@ -2,7 +2,10 @@
 // Each tool registers a name and a Main() function.
 package runner
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 // Tool represents an external tool that narmol can run.
 type Tool struct {
@@ -27,11 +30,14 @@ func Get(name string) (Tool, error) {
 	return t, nil
 }
 
-// List returns all registered tools.
+// List returns all registered tools sorted alphabetically.
 func List() []Tool {
 	list := make([]Tool, 0, len(registry))
 	for _, t := range registry {
 		list = append(list, t)
 	}
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].Name < list[j].Name
+	})
 	return list
 }

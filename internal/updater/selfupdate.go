@@ -70,21 +70,17 @@ func resolveSourceDir() string {
 	return srcDir
 }
 
-// rebuildAndReplace compiles the narmol binary from srcDir and replaces the
-// currently running executable.
+// rebuildAndReplace compiles the narmol binary from srcDir and installs it.
+// If invoked via "go run" (executable in a temp dir), it installs to $GOBIN
+// or $GOPATH/bin. Otherwise it replaces the current binary in-place.
 func rebuildAndReplace(srcDir string) {
-	execPath, err := os.Executable()
-	if err != nil {
-		fmt.Printf("[!] Cannot determine current binary path: %s\n", err)
-		return
-	}
-	execPath, _ = filepath.EvalSymlinks(execPath)
+	installPath := resolveInstallPath()
 
-	fmt.Printf("[*] Rebuilding narmol → %s\n", execPath)
+	fmt.Printf("[*] Rebuilding narmol → %s\n", installPath)
 
 	// Build to a temporary path first so a failed build doesn't destroy
 	// the current binary.
-	tmpBin := execPath + ".new"
+	tmpBin := installPath + ".new"
 	if runtime.GOOS == "windows" && !strings.HasSuffix(tmpBin, ".exe") {
 		tmpBin += ".exe"
 	}
@@ -101,25 +97,77 @@ func rebuildAndReplace(srcDir string) {
 	}
 
 	// Swap: current → .old, new → current
-	oldBin := execPath + ".old"
-	os.Remove(oldBin) // clean up leftovers from a previous update
+	oldBin := installPath + ".old"
+	os.Remove(oldBin)
 
-	if err := os.Rename(execPath, oldBin); err != nil {
-		fmt.Printf("[!] Failed to move old binary: %s\n", err)
-		os.Remove(tmpBin)
-		return
+	// The old binary may not exist yet (first install via go run)
+	if _, err := os.Stat(installPath); err == nil {
+		if err := os.Rename(installPath, oldBin); err != nil {
+			fmt.Printf("[!] Failed to move old binary: %s\n", err)
+			os.Remove(tmpBin)
+			return
+		}
 	}
-	if err := os.Rename(tmpBin, execPath); err != nil {
-		// Rollback
-		os.Rename(oldBin, execPath)
+	if err := os.Rename(tmpBin, installPath); err != nil {
+		os.Rename(oldBin, installPath) // rollback
 		fmt.Printf("[!] Failed to install new binary: %s\n", err)
 		return
 	}
 
-	// Best-effort cleanup (may fail on Windows while binary is running — that's fine)
 	os.Remove(oldBin)
 
-	fmt.Println("[+] narmol rebuilt and updated successfully!")
+	fmt.Printf("[+] narmol installed to %s\n", installPath)
+	fmt.Println("[+] Make sure this directory is in your PATH.")
+}
+
+// resolveInstallPath determines where to place the compiled binary.
+// If the current executable is a real installed binary (not from go run),
+// replace it in-place. Otherwise install to $GOBIN / $GOPATH/bin / ~/go/bin.
+func resolveInstallPath() string {
+	execPath, err := os.Executable()
+	if err == nil {
+		execPath, _ = filepath.EvalSymlinks(execPath)
+		// If the binary is NOT in a temp directory, replace it in-place
+		if !isTempPath(execPath) {
+			return execPath
+		}
+	}
+
+	// Running via "go run" — find the right install directory
+	binName := "narmol"
+	if runtime.GOOS == "windows" {
+		binName = "narmol.exe"
+	}
+
+	// 1. $GOBIN
+	if gobin := os.Getenv("GOBIN"); gobin != "" {
+		os.MkdirAll(gobin, 0755)
+		return filepath.Join(gobin, binName)
+	}
+
+	// 2. $GOPATH/bin
+	if gopath := os.Getenv("GOPATH"); gopath != "" {
+		bin := filepath.Join(gopath, "bin")
+		os.MkdirAll(bin, 0755)
+		return filepath.Join(bin, binName)
+	}
+
+	// 3. ~/go/bin (default GOPATH)
+	home, _ := os.UserHomeDir()
+	bin := filepath.Join(home, "go", "bin")
+	os.MkdirAll(bin, 0755)
+	return filepath.Join(bin, binName)
+}
+
+// isTempPath returns true if the path looks like it's inside a temp directory
+// (i.e. the binary was launched via "go run").
+func isTempPath(p string) bool {
+	p = filepath.ToSlash(strings.ToLower(p))
+	return strings.Contains(p, "/tmp/") ||
+		strings.Contains(p, "/temp/") ||
+		strings.Contains(p, "\\temp\\") ||
+		strings.Contains(p, "/go-build") ||
+		strings.Contains(p, "appdata/local/temp")
 }
 
 // narmolCacheDir returns ~/.narmol/ (or %USERPROFILE%\.narmol\ on Windows).
