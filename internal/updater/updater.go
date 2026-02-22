@@ -25,10 +25,10 @@ func DefaultTools() []ToolSource {
 		{Name: "gau", URL: "https://github.com/lc/gau", PkgName: "gau", MainFile: "cmd/gau/main.go"},
 		{Name: "httpx", URL: "https://github.com/projectdiscovery/httpx", PkgName: "httpx", MainFile: "cmd/httpx/httpx.go"},
 		{Name: "katana", URL: "https://github.com/projectdiscovery/katana", PkgName: "katana", MainFile: "cmd/katana/main.go"},
+		{Name: "naabu", URL: "https://github.com/projectdiscovery/naabu", PkgName: "naabu", MainFile: "cmd/naabu/main.go"},
 		{Name: "nuclei", URL: "https://github.com/projectdiscovery/nuclei", PkgName: "nuclei", MainFile: "cmd/nuclei/main.go"},
 		{Name: "subfinder", URL: "https://github.com/projectdiscovery/subfinder", PkgName: "subfinder", MainFile: "cmd/subfinder/main.go"},
 		{Name: "wappalyzergo", URL: "https://github.com/projectdiscovery/wappalyzergo"},
-		{Name: "amass", URL: "https://github.com/owasp-amass/amass", PkgName: "amass", MainFile: "cmd/amass/main.go", ExtraFiles: []string{"cmd/amass/process.go", "cmd/amass/process_unix.go", "cmd/amass/process_windows.go"}},
 	}
 }
 
@@ -58,41 +58,7 @@ func UpdateAll(baseDir string) {
 		if tool.Name == "nuclei" {
 			os.Remove(filepath.Join(dir, "cmd", "nuclei", "main_benchmark_test.go"))
 		}
-
-		// Amass-specific: disable the CGO libpostal binding so the build
-		// doesn't require the libpostal C library. The pure-Go fallback
-		// provides the same functionality via an HTTP API.
-		if tool.Name == "amass" {
-			patchLibpostal(dir)
-		}
 	}
-}
-
-// patchLibpostal disables the CGO libpostal binding in amass so that
-// users don't need the libpostal C library installed. The pure-Go
-// fallback (pure_go.go) is promoted to be used unconditionally.
-func patchLibpostal(amassDir string) {
-	libDir := filepath.Join(amassDir, "internal", "libpostal")
-
-	// 1. Make cgo_specific.go unreachable by setting build tag to "ignore"
-	cgoFile := filepath.Join(libDir, "cgo_specific.go")
-	data, err := os.ReadFile(cgoFile)
-	if err == nil {
-		patched := strings.Replace(string(data), "//go:build cgo", "//go:build ignore", 1)
-		patched = strings.Replace(patched, "// +build cgo", "// +build ignore", 1)
-		os.WriteFile(cgoFile, []byte(patched), 0644)
-	}
-
-	// 2. Remove the build constraint from pure_go.go so it compiles always
-	pureFile := filepath.Join(libDir, "pure_go.go")
-	data, err = os.ReadFile(pureFile)
-	if err == nil {
-		patched := strings.Replace(string(data), "//go:build !cgo", "//go:build !ignore", 1)
-		patched = strings.Replace(patched, "// +build !cgo", "// +build !ignore", 1)
-		os.WriteFile(pureFile, []byte(patched), 0644)
-	}
-
-	fmt.Println("[+] Patched amass: disabled libpostal CGO binding")
 }
 
 const sourceFile = ".narmol-source"

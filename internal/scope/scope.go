@@ -3,18 +3,21 @@ package scope
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 )
 
 // rule represents a single scope rule (inclusion or exclusion).
 type rule struct {
-	pattern string // e.g. "*.example.com" or "admin.example.com"
+	pattern string // e.g. "*.example.com", "admin.example.com", "10.0.0.1", "192.168.1.0/24"
 	exclude bool   // true if this is an exclusion rule (prefixed with -)
+	ip      net.IP // non-nil if this is a single IP rule
+	cidr    *net.IPNet // non-nil if this is a CIDR rule
 }
 
 // Scope enforces what targets can be audited.
-// It parses a scope file with wildcards and exclusions.
+// It parses a scope file with wildcards, exclusions, IPs and CIDRs.
 //
 // Format:
 //
@@ -22,6 +25,9 @@ type rule struct {
 //	api.otherdomain.com    # exact domain
 //	-admin.example.com     # exclude this specific domain
 //	-*.staging.example.com # exclude all staging subdomains
+//	10.0.0.1               # single IP
+//	192.168.1.0/24         # CIDR range
+//	-10.0.0.5              # exclude specific IP
 type Scope struct {
 	includes []rule
 	excludes []rule
@@ -78,20 +84,31 @@ func processLine(s *Scope, line string) {
 		line = strings.TrimSpace(line[:idx])
 	}
 
+	exclude := false
+	pattern := line
 	if strings.HasPrefix(line, "-") {
-		s.excludes = append(s.excludes, rule{
-			pattern: strings.TrimPrefix(line, "-"),
-			exclude: true,
-		})
+		exclude = true
+		pattern = strings.TrimPrefix(line, "-")
+	}
+
+	r := rule{pattern: pattern, exclude: exclude}
+
+	// Try to parse as CIDR (e.g. 192.168.1.0/24)
+	if _, cidr, err := net.ParseCIDR(pattern); err == nil {
+		r.cidr = cidr
+	} else if ip := net.ParseIP(pattern); ip != nil {
+		// Try to parse as single IP
+		r.ip = ip
+	}
+
+	if exclude {
+		s.excludes = append(s.excludes, r)
 	} else {
-		s.includes = append(s.includes, rule{
-			pattern: line,
-			exclude: false,
-		})
+		s.includes = append(s.includes, r)
 	}
 }
 
-// IsInScope checks whether a given target (domain/host) is within scope.
+// IsInScope checks whether a given target (domain/host/IP) is within scope.
 // Exclusions always take priority over inclusions.
 func (s *Scope) IsInScope(target string) bool {
 	target = strings.ToLower(strings.TrimSpace(target))
@@ -111,17 +128,22 @@ func (s *Scope) IsInScope(target string) bool {
 	if idx := strings.Index(target, "/"); idx != -1 {
 		target = target[:idx]
 	}
+	// Strip brackets from IPv6
+	target = strings.Trim(target, "[]")
+
+	// Check if target is an IP address
+	targetIP := net.ParseIP(target)
 
 	// Check exclusions first — they always win
 	for _, r := range s.excludes {
-		if matchPattern(r.pattern, target) {
+		if matchRule(r, target, targetIP) {
 			return false
 		}
 	}
 
 	// Check inclusions
 	for _, r := range s.includes {
-		if matchPattern(r.pattern, target) {
+		if matchRule(r, target, targetIP) {
 			return true
 		}
 	}
@@ -148,10 +170,14 @@ func (s *Scope) FilteredCount(original, filtered []string) int {
 // Domains extracts the root target domains from the scope inclusion rules.
 // For wildcards like "*.example.com", it returns "example.com".
 // For exact entries like "api.specific.org", it returns "api.specific.org".
+// IP and CIDR rules are excluded.
 func (s *Scope) Domains() []string {
 	seen := map[string]bool{}
 	var domains []string
 	for _, r := range s.includes {
+		if r.ip != nil || r.cidr != nil {
+			continue
+		}
 		domain := strings.TrimPrefix(r.pattern, "*.")
 		domain = strings.ToLower(domain)
 		if !seen[domain] {
@@ -162,13 +188,40 @@ func (s *Scope) Domains() []string {
 	return domains
 }
 
+// IPs returns all IP and CIDR inclusion rules as strings.
+func (s *Scope) IPs() []string {
+	var ips []string
+	for _, r := range s.includes {
+		if r.ip != nil || r.cidr != nil {
+			ips = append(ips, r.pattern)
+		}
+	}
+	return ips
+}
+
+// HasIPs returns true if the scope contains any IP or CIDR inclusion rules.
+func (s *Scope) HasIPs() bool {
+	for _, r := range s.includes {
+		if r.ip != nil || r.cidr != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // String returns a human-readable representation of the scope.
 func (s *Scope) String() string {
 	var sb strings.Builder
 	sb.WriteString("Scope:\n")
 	sb.WriteString("  Includes:\n")
 	for _, r := range s.includes {
-		sb.WriteString(fmt.Sprintf("    + %s\n", r.pattern))
+		label := "domain"
+		if r.cidr != nil {
+			label = "cidr"
+		} else if r.ip != nil {
+			label = "ip"
+		}
+		sb.WriteString(fmt.Sprintf("    + %s (%s)\n", r.pattern, label))
 	}
 	if len(s.excludes) > 0 {
 		sb.WriteString("  Excludes:\n")
@@ -205,7 +258,22 @@ func (s *Scope) HasWildcard(target string) bool {
 	return false
 }
 
-// matchPattern checks if a target matches a pattern.
+// matchRule checks if a target matches a rule.
+// Handles IP rules, CIDR rules, and domain patterns.
+func matchRule(r rule, target string, targetIP net.IP) bool {
+	// CIDR rule: check if target IP falls within the range
+	if r.cidr != nil {
+		return targetIP != nil && r.cidr.Contains(targetIP)
+	}
+	// IP rule: check if target IP matches exactly
+	if r.ip != nil {
+		return targetIP != nil && r.ip.Equal(targetIP)
+	}
+	// Domain pattern matching
+	return matchPattern(r.pattern, target)
+}
+
+// matchPattern checks if a target matches a domain pattern.
 // Supports:
 //   - Exact match: "example.com" matches "example.com"
 //   - Wildcard: "*.example.com" matches "sub.example.com", "a.b.example.com"

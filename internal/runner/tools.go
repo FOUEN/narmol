@@ -2,20 +2,20 @@ package runner
 
 import (
 	gau_cmd "github.com/lc/gau/v2/cmd/gau"
-	amass_cmd "github.com/owasp-amass/amass/v5/cmd/amass"
 	dnsx_cmd "github.com/projectdiscovery/dnsx/cmd/dnsx"
 	httpx_cmd "github.com/projectdiscovery/httpx/cmd/httpx"
 	katana_cmd "github.com/projectdiscovery/katana/cmd/katana"
+	naabu_cmd "github.com/projectdiscovery/naabu/v2/cmd/naabu"
 	nuclei_cmd "github.com/projectdiscovery/nuclei/v3/cmd/nuclei"
 	subfinder_cmd "github.com/projectdiscovery/subfinder/v2/cmd/subfinder"
 )
 
 func init() {
-	Register(Tool{Name: "amass", Description: "Run amass OSINT recon tool", Main: amass_cmd.Main})
 	Register(Tool{Name: "nuclei", Description: "Run nuclei scanner", Main: nuclei_cmd.Main})
 	Register(Tool{Name: "httpx", Description: "Run httpx prober", Main: httpx_cmd.Main})
 	Register(Tool{Name: "katana", Description: "Run katana crawler", Main: katana_cmd.Main})
 	Register(Tool{Name: "dnsx", Description: "Run dnsx resolver", Main: dnsx_cmd.Main})
+	Register(Tool{Name: "naabu", Description: "Run naabu port scanner", Main: naabu_cmd.Main})
 	Register(Tool{Name: "subfinder", Description: "Run subfinder enumerator", Main: subfinder_cmd.Main})
 	Register(Tool{Name: "gau", Description: "Run gau URL fetcher", Main: gau_cmd.Main})
 }

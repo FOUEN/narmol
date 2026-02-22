@@ -9,5 +9,4 @@ require (
 	github.com/projectdiscovery/katana v1.0.5
 	github.com/projectdiscovery/nuclei/v3 v3.1.0
 	github.com/projectdiscovery/subfinder/v2 v2.6.3
-	github.com/owasp-amass/amass/v5 v5.0.0
 )

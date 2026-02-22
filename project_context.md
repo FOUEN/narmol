@@ -6,20 +6,42 @@ Este documento da contexto completo a un modelo de IA para editar código de nar
 
 ## 1. Qué es narmol
 
-Un binario Go que compila 7 herramientas de seguridad externas dentro de sí mismo (no las llama via exec.Command), les añade scope enforcement y permite ejecutar workflows que encadenan herramientas. **Todo el código se ejecuta in-process como Go nativo — sin subprocesos, sin IPC, sin serialización.** Incluso componentes como el engine de amass (servidor GraphQL) se arrancan como goroutines dentro del mismo proceso.
+**Narmol** (la "n" de núcleo) es el motor CLI de **Marmol**, un producto de recon web con interfaz gráfica. 
+
+- **Narmol** = binario Go que compila herramientas de seguridad como librerías, gestiona scope, ejecuta workflows de recon y exporta resultados en JSON/texto. Todo in-process, sin subprocesos.
+- **Marmol** (futuro) = interfaz web que usa narmol como backend para lanzar reconocimientos, mostrar progreso en tiempo real y generar reports a partir del JSON de narmol.
+
+Narmol debe funcionar tanto como CLI standalone para power users como motor headless para Marmol.
+
+### Cobertura de recon objetivo
+
+1. **Definición de scope** — activos in/out-of-scope
+2. **Descubrimiento de superficie** — subdominios (pasivo: subfinder, crt.sh; activo: dnsx brute + permutaciones), dorking
+3. **Depuración de superficie** — DNS takeover check, httpx alive, tech detection (wappalyzergo), wayback URLs (gau), git exposure
+4. **Fuzzing** — crawling (katana), JS endpoints/params extraction
+5. **Vulnerability assessment** — nuclei, WAF detection, SSL/TLS config, CORS misconfig, security headers, cookie flags, HTTP request smuggling
+
+### Principio de diseño: librerías Go > CLI wrapping
+
+Las herramientas externas se usan preferentemente como **librerías Go** (sus APIs programáticas: `subfinder/v2/pkg/runner`, `httpx/runner`, `katana/pkg/engine`, `nuclei/lib`, `naabu/v2/pkg/runner`, etc.), no como wrappers de su CLI. Esto da:
+- Resultados tipados (structs Go, no parsing de stdout)
+- Callbacks para progress (futuro: WebSocket a Marmol)
+- Control de concurrencia y error handling real
+- JSON output nativo sin serialización intermedia
+
+Los checks que no necesitan tool externa (git exposure, SSL/TLS, CORS, headers, cookies, HTTP smuggling) se implementan con stdlib Go.
 
 ---
 
 ## 2. Reglas absolutas
 
-1. **NUNCA `exec.Command` / `os/exec` para ejecutar una tool ni componentes internos.** Las tools son repos clonados en `tools/`, parcheados para exponer `func Main()`, e importados como paquetes Go. Todo se ejecuta en el mismo proceso como código Go nativo — llamadas a funciones, goroutines, etc. Esto incluye componentes como el engine de amass, que se arranca in-process con `engine.NewEngine()` en vez de spawneando un subproceso. **El único uso válido de `os/exec` en todo narmol es para invocar `git` y `go build` en el módulo `updater`.**
+1. **NUNCA `exec.Command` / `os/exec` para ejecutar una tool ni componentes internos.** Las tools son repos clonados en `tools/`, parcheados para exponer `func Main()`, e importados como paquetes Go. Todo se ejecuta en el mismo proceso como código Go nativo — llamadas a funciones, goroutines, etc. **El único uso válido de `os/exec` en todo narmol es para invocar `git` y `go build` en el módulo `updater`.**
 2. **Go Workspace obligatorio.** Cada tool en `tools/` tiene su propio `go.mod`. El fichero `go.work` los une.
 3. **Patrón init() para registros.** Tools y workflows se registran en `init()` y se importan en `main.go` con `_`.
 4. **Module path = `github.com/FOUEN/narmol`.** Paquetes internos bajo `internal/`.
 5. **Scope siempre filtra.** Todo workflow recibe `*scope.Scope` y filtra antes de tocar la red.
 6. **Output en modo append.** `os.O_APPEND|os.O_CREATE|os.O_WRONLY`.
-7. **CGO habilitado**, pero la dependencia libpostal de amass se parchea con build tag `ignore` para que no requiera la librería C.
-8. **Máxima eficiencia nativa.** Al compilar todo en un solo binario Go sin subprocesos, se evita overhead de IPC, serialización y context-switching entre procesos. Cada herramienta corre como una llamada a función Go directa dentro del mismo address space.
+7. **Máxima eficiencia nativa.** Al compilar todo en un solo binario Go sin subprocesos, se evita overhead de IPC, serialización y context-switching entre procesos. Cada herramienta corre como una llamada a función Go directa dentro del mismo address space.
 
 ---
 
@@ -48,7 +70,7 @@ narmol/
 │   │   └── scope.go            # Scope struct, Load(), IsInScope(), FilterHosts(), Domains()
 │   │
 │   ├── updater/
-│   │   ├── updater.go          # ToolSource, DefaultTools(), UpdateAll(), patchLibpostal()
+│   │   ├── updater.go          # ToolSource, DefaultTools(), UpdateAll()
 │   │   ├── patcher.go          # PatchTool(), PatchFile()
 │   │   └── selfupdate.go       # SelfUpdate(), resolveSourceDir(), rebuildAndReplace(), resolveInstallPath()
 │   │
@@ -58,11 +80,11 @@ narmol/
 │           └── active.go       # ActiveWorkflow — subfinder→httpx (InputTargetHost, cross-platform)
 │
 └── tools/                      # Repos clonados y parcheados (gestionados por narmol update)
-    ├── amass/
     ├── dnsx/
     ├── gau/
     ├── httpx/
     ├── katana/
+    ├── naabu/
     ├── nuclei/
     ├── subfinder/
     └── wappalyzergo/
@@ -82,7 +104,7 @@ go run . update
 
 `go run . update` ejecuta:
 1. Detecta que estamos en el source dir
-2. `UpdateAll()`: clona/actualiza los 8 repos en `tools/`, parchea main→Main, parchea libpostal
+2. `UpdateAll()`: clona/actualiza los 8 repos en `tools/`, parchea main→Main
 3. `rebuildAndReplace()`: compila el binario completo
 4. Detecta que se ejecutó via `go run` (path temporal) → instala en `$GOBIN` o `~/go/bin`
 
@@ -181,13 +203,12 @@ func List() []Tool                  // sorted alphabetically
 package runner
 
 import (
-	amass_cmd "github.com/owasp-amass/amass/v5/cmd/amass"
-	// ... 6 more
+	// ... 6 tool imports
 )
 
 func init() {
-	Register(Tool{Name: "amass", Main: amass_cmd.Main})
-	// ... 6 more (dnsx, gau, httpx, katana, nuclei, subfinder)
+	Register(Tool{Name: "nuclei", Main: nuclei_cmd.Main})
+	// ... 5 more (dnsx, gau, httpx, katana, subfinder)
 }
 ```
 
@@ -218,12 +239,8 @@ type ToolSource struct {
 	ExtraFiles []string
 }
 
-func DefaultTools() []ToolSource { /* 8 entries */ }
-func UpdateAll(baseDir string)   { /* clone/pull + patch + patchLibpostal + nuclei test cleanup */ }
-func patchLibpostal(amassDir string) {
-	// cgo_specific.go: "//go:build cgo" → "//go:build ignore"
-	// pure_go.go: "//go:build !cgo" → "//go:build !ignore"
-}
+func DefaultTools() []ToolSource { /* 7 entries */ }
+func UpdateAll(baseDir string)   { /* clone/pull + patch + nuclei test cleanup */ }
 ```
 
 ---
@@ -344,3 +361,147 @@ narmol update                # actualiza tools y recompila in-place
 # Build manual
 go build -o narmol .         # requiere que tools/ esté parcheado
 ```
+
+---
+
+## 9. Workflows TODO
+
+### Core workflows
+
+Workflows principales que cubren el pipeline completo de recon → vuln assessment.
+
+#### `recon` ✅ (implementado) — Descubrimiento pasivo
+
+No toca el target directamente. Solo fuentes externas.
+
+- [x] Subdomain enumeration pasiva (subfinder) — solo si scope tiene wildcard
+- [x] Subdomain enumeration pasiva **recursiva** (subdominios descubiertos → input de nuevo)
+- [x] Recolectar URLs históricas (gau: Wayback, Common Crawl, OTX, URLScan)
+- [x] Soporte de scope exacto (`-s example.com`) — skip subfinder, solo gau
+- [x] Soporte de IPs/CIDRs en scope
+- [x] Scope filter en cada paso
+- [x] Dedup global de resultados
+- [x] Output JSON: subdominios + URLs históricas (tipo, valor, fuente, dominio)
+- [ ] Output JSON: subdominios + URLs históricas
+
+#### `web` — Reconocimiento web activo
+
+Toca el target. Cubre descubrimiento, depuración de superficie, y fingerprinting.
+
+- [ ] Ejecutar `recon` como primer paso
+- [ ] Resolución DNS de todos los subdominios descubiertos (dnsx)
+- [ ] Alive check — hosts con servicio web (httpx)
+- [ ] Tech detection en hosts alive (wappalyzergo)
+- [ ] DNS takeover check (CNAME → dominio inexistente/disponible)
+- [ ] Git exposure check (`/.git/HEAD` accesible)
+- [ ] Crawling de hosts alive (katana: robots.txt, sitemap, links)
+- [ ] Extracción de endpoints y parámetros desde JavaScript
+- [ ] Scope filter en cada paso
+- [ ] Output JSON: subdominios, hosts alive, tecnologías, URLs crawleadas, findings
+
+#### `vulnscan` — Assessment de vulnerabilidades
+
+Input: output del workflow `web` (hosts alive + URLs).
+
+- [ ] Nuclei scan (severidad configurable, por defecto medium+)
+- [ ] Security headers check (X-Frame-Options, CSP, HSTS, X-Content-Type-Options, etc.)
+- [ ] CORS misconfiguration check
+- [ ] Cookie flags check (HttpOnly, Secure, SameSite)
+- [ ] SSL/TLS config check (versión protocolo, ciphers, expiración certificado)
+- [ ] Open redirect check básico
+- [ ] Scope filter en cada paso
+- [ ] Output JSON: vulnerabilidades categorizadas por severidad
+
+#### `full` — Scan completo
+
+Orquesta todos los core workflows + soporte de IPs/CIDR.
+
+- [ ] Soporte de IPs individuales y CIDR en scope
+- [ ] Ejecutar `recon`
+- [ ] Ejecutar `web`
+- [ ] Ejecutar `vulnscan`
+- [ ] Port scan en IPs/CIDR del scope (si aplica)
+- [ ] Output JSON unificado: superficie completa + vulnerabilidades
+
+---
+
+### Mini-workflows
+
+Workflows pequeños para tareas específicas. Se pueden usar standalone o como bloques reutilizables desde los core workflows.
+
+#### `active` ✅ (ya implementado)
+
+Subfinder → httpx. Descubre subdominios y comprueba cuáles tienen servicio web.
+
+#### `subdomains`
+
+Solo enumeración de subdominios (pasivo + activo), sin probing.
+
+- [ ] Subfinder (pasivo)
+- [ ] Subfinder recursivo
+- [ ] Resolución DNS (dnsx)
+- [ ] Dedup + scope filter
+- [ ] Output: lista limpia de subdominios
+
+#### `alive`
+
+Solo comprobar qué hosts de una lista están activos.
+
+- [ ] Input: lista de hosts (fichero o stdin)
+- [ ] httpx probe
+- [ ] Output: hosts alive con status code, título, server
+
+#### `techdetect`
+
+Detectar tecnologías en hosts alive.
+
+- [ ] Input: lista de URLs/hosts alive
+- [ ] wappalyzergo fingerprinting
+- [ ] Output JSON: host → tecnologías detectadas
+
+#### `crawl`
+
+Crawling y extracción de endpoints.
+
+- [ ] Input: lista de URLs alive
+- [ ] Katana crawl (robots.txt, sitemap, links, JS)
+- [ ] Extracción de endpoints JS
+- [ ] Extracción de parámetros JS
+- [ ] Output: URLs descubiertas
+
+#### `urls`
+
+Recolección de URLs históricas + crawling.
+
+- [ ] gau (Wayback, Common Crawl, etc.)
+- [ ] katana crawl
+- [ ] Dedup + scope filter
+- [ ] Output: lista unificada de URLs
+
+#### `headers`
+
+Auditoría de security headers y configuración.
+
+- [ ] Input: lista de URLs alive
+- [ ] Security headers check (CSP, HSTS, X-Frame, X-Content-Type, Referrer-Policy, Permissions-Policy)
+- [ ] Cookie flags check (HttpOnly, Secure, SameSite)
+- [ ] CORS misconfiguration check
+- [ ] SSL/TLS check (versión, ciphers, cert expiry)
+- [ ] Output JSON: findings por host
+
+#### `takeover`
+
+Detección de subdomain takeover.
+
+- [ ] Input: lista de subdominios
+- [ ] Resolución CNAME
+- [ ] Check si el CNAME apunta a servicio abandonado (S3, GitHub Pages, Heroku, etc.)
+- [ ] Output: subdominios vulnerables + servicio
+
+#### `gitexpose`
+
+Detección de repositorios git expuestos.
+
+- [ ] Input: lista de URLs alive
+- [ ] Check `/.git/HEAD`, `/.git/config`
+- [ ] Output: hosts con git expuesto

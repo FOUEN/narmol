@@ -28,7 +28,13 @@ func RunWorkflow(args []string) {
 
 	fmt.Print(s.String())
 	domains := s.Domains()
-	fmt.Printf("[*] Target domains: %s\n", strings.Join(domains, ", "))
+	if len(domains) > 0 {
+		fmt.Printf("[*] Target domains: %s\n", strings.Join(domains, ", "))
+	}
+	ips := s.IPs()
+	if len(ips) > 0 {
+		fmt.Printf("[*] Target IPs/CIDRs: %s\n", strings.Join(ips, ", "))
+	}
 
 	// Get workflow
 	w, err := workflows.Get(name)

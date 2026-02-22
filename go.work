@@ -2,11 +2,11 @@ go 1.24.4
 
 use (
 	.
-	./tools/amass
 	./tools/dnsx
 	./tools/gau
 	./tools/httpx
 	./tools/katana
+	./tools/naabu
 	./tools/nuclei
 	./tools/subfinder
 	./tools/wappalyzergo
