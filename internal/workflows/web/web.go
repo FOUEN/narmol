@@ -2,17 +2,22 @@ package web
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/FOUEN/narmol/internal/scope"
 	"github.com/FOUEN/narmol/internal/workflows"
+	"github.com/FOUEN/narmol/internal/workflows/secrets"
 
 	"github.com/projectdiscovery/goflags"
 	httpx_runner "github.com/projectdiscovery/httpx/runner"
@@ -106,13 +111,35 @@ func (w *WebWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOp
 	}
 	fmt.Printf("[+] %d live hosts found, %d unique technologies detected\n", len(liveHosts), len(techSet))
 
-	// ── Step 3: nuclei — targeted vulnerability scan ──────────────────
-	// Nessus-style: use fingerprint to select only relevant templates.
-	// Instead of running all 10k+ templates, we filter by detected tech stack.
+	// ── Step 3: nuclei + trufflehog + security checks IN PARALLEL ─────
 	tags := buildNucleiTags(techSet)
 	fmt.Printf("[+] Nuclei tags from fingerprint: %s\n", strings.Join(tags, ", "))
 
-	vulnCount := w.runNuclei(liveHosts, tags, emitUnique)
+	var wg sync.WaitGroup
+	var vulnCount, secretCount, headerCount int64
+
+	// 3a. Nuclei — targeted vulnerability scan
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		vulnCount = w.runNuclei(liveHosts, tags, emitUnique)
+	}()
+
+	// 3b. TruffleHog — check for exposed .git repos and scan for secrets
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		secretCount = w.runGitExposureCheck(liveHosts, emitUnique)
+	}()
+
+	// 3c. Security header checks — CORS, missing headers, cookies (stdlib)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		headerCount = w.runSecurityHeaderChecks(liveHosts, emitUnique)
+	}()
+
+	wg.Wait()
 
 	// ── Summary ───────────────────────────────────────────────────────
 	if opts.TextFile != "" {
@@ -121,8 +148,8 @@ func (w *WebWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOp
 	if opts.JSONFile != "" {
 		fmt.Printf("[+] JSON results saved to: %s\n", opts.JSONFile)
 	}
-	fmt.Printf("[+] Workflow 'web' completed — %d live, %d techs, %d vulns\n",
-		len(liveHosts), len(techSet), vulnCount)
+	fmt.Printf("[+] Workflow 'web' completed — %d live, %d techs, %d vulns, %d secrets, %d header issues\n",
+		len(liveHosts), len(techSet), vulnCount, secretCount, headerCount)
 	return nil
 }
 
@@ -305,7 +332,7 @@ func (w *WebWorkflow) runNuclei(targets []string, tags []string, emitUnique func
 
 // webResult is the unified result type for all phases of the web workflow.
 type webResult struct {
-	Phase      string   `json:"phase"`                 // "probe", "vuln"
+	Phase      string   `json:"phase"`                 // "probe", "vuln", "secret", "header"
 	Value      string   `json:"value"`                 // URL or matched-at
 	Host       string   `json:"host,omitempty"`        // target host
 	StatusCode int      `json:"status_code,omitempty"` // HTTP status
@@ -318,6 +345,7 @@ type webResult struct {
 	VulnName   string   `json:"vuln_name,omitempty"`   // vulnerability name
 	Severity   string   `json:"severity,omitempty"`    // low/medium/high/critical
 	VulnType   string   `json:"vuln_type,omitempty"`   // http/dns/network/etc
+	Detail     string   `json:"detail,omitempty"`      // extra detail for header/secret findings
 }
 
 func (r webResult) summary() string {
@@ -334,6 +362,10 @@ func (r webResult) summary() string {
 		return fmt.Sprintf("[LIVE] %s (%d)%s%s", r.Value, r.StatusCode, title, tech)
 	case "vuln":
 		return fmt.Sprintf("[%s] %s — %s (%s)", strings.ToUpper(r.Severity), r.Value, r.VulnName, r.TemplateID)
+	case "secret":
+		return fmt.Sprintf("[SECRET] %s — %s", r.Value, r.Detail)
+	case "header":
+		return fmt.Sprintf("[HEADER] %s — %s", r.Value, r.Detail)
 	default:
 		return r.Value
 	}
@@ -458,4 +490,210 @@ func buildNucleiTags(techSet map[string]struct{}) []string {
 	}
 	sort.Strings(tags)
 	return tags
+}
+
+// ─── Git Exposure + TruffleHog ──────────────────────────────────────────
+
+// runGitExposureCheck checks each live host for exposed .git/HEAD.
+// If found, runs TruffleHog to scan for leaked secrets in the exposed repo.
+func (w *WebWorkflow) runGitExposureCheck(liveHosts []string, emitUnique func(webResult) bool) int64 {
+	fmt.Printf("[*] Checking %d hosts for .git exposure...\n", len(liveHosts))
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			MaxIdleConns:        50,
+			MaxIdleConnsPerHost: 10,
+			DialContext: (&net.Dialer{
+				Timeout: 3 * time.Second,
+			}).DialContext,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // don't follow redirects
+		},
+	}
+
+	var count int64
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 20) // concurrency limiter
+
+	for _, host := range liveHosts {
+		wg.Add(1)
+		go func(h string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			gitURL := strings.TrimRight(h, "/") + "/.git/HEAD"
+			resp, err := client.Get(gitURL)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+
+			// Read small body to check for git signature
+			buf := make([]byte, 256)
+			n, _ := resp.Body.Read(buf)
+			body := string(buf[:n])
+
+			if resp.StatusCode == 200 && strings.HasPrefix(body, "ref: refs/") {
+				emitUnique(webResult{
+					Phase:    "secret",
+					Value:    h,
+					Severity: "high",
+					Detail:   ".git repository exposed — scanning for secrets",
+				})
+
+				// Run TruffleHog on the exposed git repo
+				results, err := secrets.ScanGitRepo(h)
+				if err != nil {
+					fmt.Printf("[!] TruffleHog error for %s: %s\n", h, err)
+					return
+				}
+				for _, sr := range results {
+					emitUnique(webResult{
+						Phase:    "secret",
+						Value:    h,
+						Severity: "critical",
+						Detail:   fmt.Sprintf("[%s] %s", sr.DetectorType, sr.Redacted),
+					})
+					atomic.AddInt64(&count, 1)
+				}
+			}
+		}(host)
+	}
+
+	wg.Wait()
+	exposures := atomic.LoadInt64(&count)
+	fmt.Printf("[+] Git exposure check done — %d secrets found\n", exposures)
+	return exposures
+}
+
+// ─── Security Header Checks (stdlib) ────────────────────────────────────
+
+// requiredHeaders are security headers that should be present on any web application.
+var requiredHeaders = []struct {
+	Name     string
+	Severity string
+}{
+	{"Strict-Transport-Security", "medium"},
+	{"X-Content-Type-Options", "low"},
+	{"X-Frame-Options", "medium"},
+	{"Content-Security-Policy", "medium"},
+	{"Referrer-Policy", "low"},
+	{"Permissions-Policy", "low"},
+}
+
+// runSecurityHeaderChecks performs fast HTTP requests to check for missing security
+// headers, CORS misconfigurations, and insecure cookies. Pure stdlib, no external tools.
+func (w *WebWorkflow) runSecurityHeaderChecks(liveHosts []string, emitUnique func(webResult) bool) int64 {
+	fmt.Printf("[*] Checking security headers on %d hosts...\n", len(liveHosts))
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			MaxIdleConns:        50,
+			MaxIdleConnsPerHost: 10,
+			DialContext: (&net.Dialer{
+				Timeout: 3 * time.Second,
+			}).DialContext,
+		},
+	}
+
+	var count int64
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 20) // concurrency limiter
+
+	for _, host := range liveHosts {
+		wg.Add(1)
+		go func(h string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			req, err := http.NewRequest("GET", h, nil)
+			if err != nil {
+				return
+			}
+			req.Header.Set("Origin", "https://evil.com")
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+			resp, err := client.Do(req)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+
+			// Check missing security headers
+			for _, hdr := range requiredHeaders {
+				if resp.Header.Get(hdr.Name) == "" {
+					if emitUnique(webResult{
+						Phase:    "header",
+						Value:    h,
+						Severity: hdr.Severity,
+						Detail:   "Missing " + hdr.Name,
+					}) {
+						atomic.AddInt64(&count, 1)
+					}
+				}
+			}
+
+			// Check CORS misconfiguration
+			acao := resp.Header.Get("Access-Control-Allow-Origin")
+			if acao == "*" || acao == "https://evil.com" {
+				if emitUnique(webResult{
+					Phase:    "header",
+					Value:    h,
+					Severity: "high",
+					Detail:   fmt.Sprintf("CORS misconfiguration: Access-Control-Allow-Origin: %s", acao),
+				}) {
+					atomic.AddInt64(&count, 1)
+				}
+			}
+
+			// Check ACAO with credentials (very dangerous)
+			acac := resp.Header.Get("Access-Control-Allow-Credentials")
+			if acac == "true" && (acao == "*" || acao == "https://evil.com") {
+				if emitUnique(webResult{
+					Phase:    "header",
+					Value:    h,
+					Severity: "critical",
+					Detail:   "CORS with credentials: origin reflected + Allow-Credentials: true",
+				}) {
+					atomic.AddInt64(&count, 1)
+				}
+			}
+
+			// Check insecure cookies
+			for _, cookie := range resp.Cookies() {
+				var issues []string
+				if !cookie.Secure && strings.HasPrefix(h, "https://") {
+					issues = append(issues, "missing Secure")
+				}
+				if !cookie.HttpOnly {
+					issues = append(issues, "missing HttpOnly")
+				}
+				if cookie.SameSite == http.SameSiteNoneMode || cookie.SameSite == 0 {
+					issues = append(issues, "missing/weak SameSite")
+				}
+				if len(issues) > 0 {
+					if emitUnique(webResult{
+						Phase:    "header",
+						Value:    h,
+						Severity: "low",
+						Detail:   fmt.Sprintf("Cookie '%s': %s", cookie.Name, strings.Join(issues, ", ")),
+					}) {
+						atomic.AddInt64(&count, 1)
+					}
+				}
+			}
+		}(host)
+	}
+
+	wg.Wait()
+	total := atomic.LoadInt64(&count)
+	fmt.Printf("[+] Security header checks done — %d issues found\n", total)
+	return total
 }

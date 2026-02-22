@@ -94,14 +94,9 @@ func (w *ReconWorkflow) Run(domain string, s *scope.Scope, opts workflows.Output
 	var subdomainCount, urlCount int64
 
 	// ── Step 1: Subfinder (only if wildcard scope) ────────────────────
+	var subs []string
 	if s.HasWildcard(domain) {
-		subs := w.runSubfinder(domain, s, emitUnique, &subdomainCount)
-
-		// ── Step 1b: Recursive subfinder ──────────────────────────────
-		// Feed discovered subdomains back to find deeper levels.
-		if len(subs) > 0 {
-			w.runSubfinderRecursive(subs, s, emitUnique, &subdomainCount)
-		}
+		subs = w.runSubfinder(domain, s, emitUnique, &subdomainCount)
 	} else {
 		// Exact domain — emit the domain itself as a subdomain result
 		emitUnique(reconResult{Type: "subdomain", Value: domain, Source: "scope", Domain: domain})
@@ -109,11 +104,27 @@ func (w *ReconWorkflow) Run(domain string, s *scope.Scope, opts workflows.Output
 		fmt.Printf("[*] Exact domain scope — skipping subfinder for %s\n", domain)
 	}
 
-	// ── Step 2: Gau (historical URLs) ─────────────────────────────────
-	w.runGau(domain, s, emitUnique, &urlCount)
+	// ── Step 1b + Step 2: recursive subfinder + gau IN PARALLEL ───────
+	var wg sync.WaitGroup
+
+	if len(subs) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.runSubfinderRecursive(subs, s, emitUnique, &subdomainCount)
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		w.runGau(domain, s, emitUnique, &urlCount)
+	}()
+
+	wg.Wait()
 
 	// ── Summary ───────────────────────────────────────────────────────
-	subs := atomic.LoadInt64(&subdomainCount)
+	subCount := atomic.LoadInt64(&subdomainCount)
 	urls := atomic.LoadInt64(&urlCount)
 
 	if opts.JSONFile != "" {
@@ -122,7 +133,7 @@ func (w *ReconWorkflow) Run(domain string, s *scope.Scope, opts workflows.Output
 	if opts.TextFile != "" {
 		fmt.Printf("[+] Text results saved to: %s\n", opts.TextFile)
 	}
-	fmt.Printf("[+] Recon for %s completed — %d subdomains, %d URLs collected.\n", domain, subs, urls)
+	fmt.Printf("[+] Recon for %s completed — %d subdomains, %d URLs collected.\n", domain, subCount, urls)
 	return nil
 }
 

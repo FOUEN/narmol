@@ -59,7 +59,7 @@ func (w *SecretsWorkflow) Run(domain string, s *scope.Scope, opts workflows.Outp
 		defer jsonFile.Close()
 	}
 
-	emit := func(r secretResult) {
+	emit := func(r SecretResult) {
 		if textFile == nil && jsonFile == nil {
 			fmt.Println(r.OneLiner())
 		}
@@ -108,12 +108,12 @@ func (w *SecretsWorkflow) Run(domain string, s *scope.Scope, opts workflows.Outp
 
 // ScanGitRepo scans a git repository URL for secrets and returns results.
 // This is the public API for use by other workflows.
-func ScanGitRepo(repoURL string) ([]secretResult, error) {
-	var results []secretResult
+func ScanGitRepo(repoURL string) ([]SecretResult, error) {
+	var results []SecretResult
 	var mu sync.Mutex
 	var count int64
 
-	emit := func(r secretResult) {
+	emit := func(r SecretResult) {
 		mu.Lock()
 		results = append(results, r)
 		mu.Unlock()
@@ -125,12 +125,12 @@ func ScanGitRepo(repoURL string) ([]secretResult, error) {
 
 // ScanPath scans a filesystem path for secrets and returns results.
 // This is the public API for use by other workflows.
-func ScanPath(path string) ([]secretResult, error) {
-	var results []secretResult
+func ScanPath(path string) ([]SecretResult, error) {
+	var results []SecretResult
 	var mu sync.Mutex
 	var count int64
 
-	emit := func(r secretResult) {
+	emit := func(r SecretResult) {
 		mu.Lock()
 		results = append(results, r)
 		mu.Unlock()
@@ -140,7 +140,7 @@ func ScanPath(path string) ([]secretResult, error) {
 	return results, err
 }
 
-func scanGit(repoURL string, emit func(secretResult), count *int64) error {
+func scanGit(repoURL string, emit func(SecretResult), count *int64) error {
 	ctx := context.Background()
 
 	sourceMgr := sources.NewManager(
@@ -189,7 +189,7 @@ func scanGit(repoURL string, emit func(secretResult), count *int64) error {
 	return nil
 }
 
-func scanFilesystem(path string, emit func(secretResult), count *int64) error {
+func scanFilesystem(path string, emit func(SecretResult), count *int64) error {
 	ctx := context.Background()
 
 	sourceMgr := sources.NewManager(
@@ -235,13 +235,13 @@ func scanFilesystem(path string, emit func(secretResult), count *int64) error {
 	return nil
 }
 
-func resultToSecret(r detectors.ResultWithMetadata, source, target string) secretResult {
+func resultToSecret(r detectors.ResultWithMetadata, source, target string) SecretResult {
 	detectorName := r.DetectorType.String()
 	if r.DetectorName != "" {
 		detectorName = r.DetectorName
 	}
 
-	return secretResult{
+	return SecretResult{
 		Type:         "secret",
 		DetectorType: detectorName,
 		Verified:     r.Verified,
@@ -272,8 +272,8 @@ func determineScanType(target string) string {
 	return "auto"
 }
 
-// secretResult represents a secret finding from TruffleHog.
-type secretResult struct {
+// SecretResult represents a secret finding from TruffleHog.
+type SecretResult struct {
 	Type         string            `json:"type"`
 	DetectorType string            `json:"detector_type"`
 	Verified     bool              `json:"verified"`
@@ -284,7 +284,7 @@ type secretResult struct {
 	ExtraData    map[string]string `json:"extra_data,omitempty"`
 }
 
-func (r secretResult) OneLiner() string {
+func (r SecretResult) OneLiner() string {
 	verified := ""
 	if r.Verified {
 		verified = " [VERIFIED]"

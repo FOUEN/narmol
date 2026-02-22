@@ -71,6 +71,8 @@ narmol workflow <name> -s <scope.txt> [-o [file]] [-oj [file]]
 
 Discovers subdomains and historical URLs **without touching the target**. Only queries external data sources.
 
+Recursive subfinder and gau run **in parallel** for faster results.
+
 ```
 narmol workflow recon -s scope.txt -oj recon.json
 ```
@@ -124,24 +126,23 @@ narmol workflow web -s scope.txt -oj web.json
 **Pipeline:**
 
 1. **Subfinder** — discovers subdomains (only if scope has wildcard `*.example.com`)
-2. **httpx** — probes all hosts for live web services + **fingerprints the tech stack** (technologies, server, CDN)
-3. **Nuclei** — targeted vulnerability scan using **only templates matching the detected technologies**
+2. **httpx** — probes all hosts for live web services + **fingerprints the tech stack**
+3. **In parallel (goroutines):**
+   - **Nuclei** — targeted vulnerability scan (only templates matching detected tech)
+   - **TruffleHog** — checks for exposed `.git/HEAD` → if found, scans for leaked secrets
+   - **Security headers** — checks missing HSTS, CSP, X-Frame-Options, CORS misconfig, insecure cookies (stdlib)
 
 **Nessus-style optimization:**
-- httpx detects technologies (e.g. nginx, WordPress, PHP) via wappalyzer
-- Detected tech is mapped to nuclei template tags (e.g. "wordpress" → `wordpress`, `wp`, `wp-plugin`)
+- httpx detects technologies via wappalyzer → mapped to nuclei template tags
 - Generic checks always run: `exposure`, `misconfig`, `default-login`, `takeover`, `config`
 - Instead of running all 10,000+ nuclei templates, only relevant ones are loaded
-
-**Behavior:**
-- Stops early if no live hosts found after httpx
-- Results stream in real-time as they are discovered
-- Every result is scope-filtered
 
 **JSON output:**
 ```json
 {"phase":"probe","value":"https://api.example.com","host":"api.example.com","status_code":200,"title":"API","tech":["nginx","PHP"],"cdn":false}
-{"phase":"vuln","value":"https://api.example.com","host":"api.example.com","template_id":"cve-2024-1234","vuln_name":"RCE via X","severity":"critical"}
+{"phase":"vuln","value":"https://api.example.com","template_id":"cve-2024-1234","vuln_name":"RCE","severity":"critical"}
+{"phase":"secret","value":"https://api.example.com","severity":"critical","detail":"[AWS] AKIA****"}
+{"phase":"header","value":"https://api.example.com","severity":"medium","detail":"Missing Strict-Transport-Security"}
 ```
 
 ### `secrets` — Secret Scanning

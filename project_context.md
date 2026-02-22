@@ -355,8 +355,9 @@ Workflow de reconocimiento pasivo — **NUNCA toca el target directamente**. Sol
 
 **Pipeline:**
 1. **Subfinder** (solo si wildcard scope) — enumeración pasiva de subdominios
-2. **Subfinder recursivo** — alimenta los subdominios descubiertos de vuelta para encontrar niveles más profundos (e.g. `sub.sub.example.com`). Solo recurre en subdominios con ≥2 puntos. Timeout más corto (`MaxEnumerationTime: 5`).
-3. **Gau** — recolecta URLs históricas de Wayback Machine, Common Crawl, OTX, URLScan
+2. **En paralelo (goroutines + sync.WaitGroup):**
+   - **Subfinder recursivo** — alimenta los subdominios descubiertos de vuelta para encontrar niveles más profundos
+   - **Gau** — recolecta URLs históricas de Wayback Machine, OTX, URLScan
 
 **Comportamiento:**
 - Si scope tiene wildcard (`*.example.com`): ejecuta los 3 pasos
@@ -426,12 +427,13 @@ eng, _ := engine.NewEngine(ctx, &engine.Config{
 **Patrón de ejecución:**
 1. `eng.Start(ctx)` — arranca workers (scanner, detector, notifier)
 2. `eng.ScanGit(ctx, config)` o `eng.ScanFileSystem(ctx, config)` — inicia scan asíncrono
-3. Goroutine consume `eng.ResultsChan()` — convierte `detectors.ResultWithMetadata` → `secretResult`
+3. Goroutine consume `eng.ResultsChan()` — convierte `detectors.ResultWithMetadata` → `SecretResult`
 4. `eng.Finish(ctx)` — espera a que terminen todos los workers
 
-**API pública** (para uso desde otros workflows):
-- `ScanGitRepo(url string) ([]secretResult, error)` — escanea repo git y devuelve resultados
-- `ScanPath(path string) ([]secretResult, error)` — escanea directorio local y devuelve resultados
+**API pública** (para uso desde otros workflows, e.g. web workflow):
+- `ScanGitRepo(url string) ([]SecretResult, error)` — escanea repo git y devuelve resultados
+- `ScanPath(path string) ([]SecretResult, error)` — escanea directorio local y devuelve resultados
+- `SecretResult` — tipo exportado para uso cross-package
 
 Imports clave:
 - `"github.com/trufflesecurity/trufflehog/v3/pkg/engine"`
@@ -439,9 +441,9 @@ Imports clave:
 - `"github.com/trufflesecurity/trufflehog/v3/pkg/detectors"`
 - `"github.com/trufflesecurity/trufflehog/v3/pkg/context"`
 
-Struct `secretResult`:
+Struct `SecretResult` (exportado):
 ```go
-type secretResult struct {
+type SecretResult struct {
     Type         string            `json:"type"`          // siempre "secret"
     DetectorType string            `json:"detector_type"` // "AWS", "GitHub", "Slack", etc.
     Verified     bool              `json:"verified"`
@@ -459,25 +461,28 @@ Funciones internas: `scanGit()`, `scanFilesystem()`, `resultToSecret()`, `determ
 
 ### 5.16 `internal/workflows/web/web.go`
 
-Workflow de auditoría web estilo Nessus — **fingerprint primero, scan después**. Solo ejecuta templates relevantes al stack detectado.
+Workflow de auditoría web estilo Nessus — **fingerprint primero, scan después**. Post-httpx todo corre en paralelo con goroutines.
 
-**Pipeline (3 pasos):**
-1. **Subfinder** (solo si wildcard scope) — enumeración pasiva de subdominios + siempre incluye el dominio raíz
+**Pipeline (3 pasos, paso 3 paralelo):**
+1. **Subfinder** (solo si wildcard scope) — enumeración pasiva de subdominios
 2. **httpx** — probing + fingerprinting: tech detection (wappalyzer), web server, CDN, title
-3. **Nuclei** — vulnerability scan **filtrado por tags** derivados del fingerprint de httpx
+3. **En paralelo (sync.WaitGroup):**
+   - **Nuclei** — vulnerability scan filtrado por tags del fingerprint
+   - **TruffleHog** — check `.git/HEAD` exposure → si expuesto, scan de secretos (usa API pública `secrets.ScanGitRepo()`)
+   - **Security headers** — checks de stdlib: HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, CORS misconfig, cookie flags
 
-**Optimización estilo Nessus:**
-- httpx detecta tecnologías → se mapean a nuclei tags via `techTagMap`
-- Ejemplo: httpx detecta "WordPress" + "nginx" → nuclei carga solo templates con tags `wordpress`, `wp`, `wp-plugin`, `wp-theme`, `nginx`
-- Tags genéricos siempre activos: `exposure`, `misconfig`, `default-login`, `takeover`, `config`
-- Resultado: en vez de cargar 10k+ templates, solo se cargan los relevantes al stack
-- WebServer header se parsea para extraer el nombre base ("nginx/1.19.0" → "nginx")
+**Git exposure check:**
+- HTTP GET a `{host}/.git/HEAD` con timeout 5s, sin follow redirects
+- Si respuesta 200 + body empieza con "ref: refs/" → repo git expuesto
+- Ejecuta `secrets.ScanGitRepo(host)` para buscar secretos filtrados
+- Concurrencia limitada a 20 goroutines (semaphore pattern)
 
-**Comportamiento:**
-- Si no hay live hosts tras httpx → early stop
-- Dedup global por fase con `sync.Map` (key = `phase:value`)
-- Scope filter en subfinder callback
-- Resultados se emiten en streaming conforme se descubren
+**Security header checks (stdlib, sin tools externas):**
+- Missing: Strict-Transport-Security, X-Content-Type-Options, X-Frame-Options, Content-Security-Policy, Referrer-Policy, Permissions-Policy
+- CORS: `Access-Control-Allow-Origin: *` o reflected origin + `Allow-Credentials: true`
+- Cookies: missing Secure, HttpOnly, SameSite flags
+- Usa `Origin: https://evil.com` en request para detectar CORS reflection
+- Concurrencia limitada a 20 goroutines (semaphore pattern)
 
 **Configuración httpx:**
 ```go
@@ -499,12 +504,14 @@ Imports clave:
 - `nuclei "github.com/projectdiscovery/nuclei/v3/lib"`
 - `nuclei_output "github.com/projectdiscovery/nuclei/v3/pkg/output"`
 - `subfinder_runner "github.com/projectdiscovery/subfinder/v2/pkg/runner"`
+- `"github.com/FOUEN/narmol/internal/workflows/secrets"` — para TruffleHog
+- `"crypto/tls"`, `"net"`, `"net/http"`, `"time"` — para checks de stdlib
 
 Struct `webResult`:
 ```go
 type webResult struct {
-    Phase      string   `json:"phase"`                 // "probe", "vuln"
-    Value      string   `json:"value"`                 // URL or matched-at
+    Phase      string   `json:"phase"`                 // "probe", "vuln", "secret", "header"
+    Value      string   `json:"value"`
     Host       string   `json:"host,omitempty"`
     StatusCode int      `json:"status_code,omitempty"`
     Title      string   `json:"title,omitempty"`
@@ -516,12 +523,13 @@ type webResult struct {
     VulnName   string   `json:"vuln_name,omitempty"`
     Severity   string   `json:"severity,omitempty"`
     VulnType   string   `json:"vuln_type,omitempty"`
+    Detail     string   `json:"detail,omitempty"`      // extra detail for header/secret findings
 }
 ```
 
-Funciones: `runSubfinder()`, `runHttpx()`, `runNuclei()`, `buildNucleiTags()`, `appendUnique()`
+Funciones: `runSubfinder()`, `runHttpx()`, `runNuclei()`, `runGitExposureCheck()`, `runSecurityHeaderChecks()`, `buildNucleiTags()`, `appendUnique()`
 
-Variables globales: `alwaysTags` (generic check categories), `techTagMap` (wappalyzer → nuclei tag mapping, 50+ entries)
+Variables globales: `alwaysTags`, `techTagMap` (50+ entries), `requiredHeaders` (6 security headers)
 
 ---
 
@@ -632,11 +640,14 @@ Fingerprint first, scan after. Pipeline: subfinder→httpx(fingerprint)→nuclei
 - [x] Alive check + fingerprinting (httpx): tech detection, CDN, title, webserver
 - [x] Tech → nuclei tag mapping (techTagMap: 50+ entries, wappalyzer → nuclei tags)
 - [x] Targeted vulnerability scan (nuclei: solo templates del stack detectado)
+- [x] Git exposure check (.git/HEAD) + TruffleHog secret scan si expuesto
+- [x] Security header checks stdlib: HSTS, CSP, X-Frame, CORS, cookies
+- [x] Nuclei + TruffleHog + headers corren en PARALELO (goroutines + sync.WaitGroup)
 - [x] Generic checks siempre activos: exposure, misconfig, default-login, takeover, config
 - [x] Scope filter en cada paso
 - [x] Early stop si no hay live hosts
 - [x] Dedup global por fase
-- [x] Output JSON: probe (live hosts + tech) + vuln (vulnerabilidades filtradas por stack)
+- [x] Output JSON: probe (live hosts + tech) + vuln (vulnerabilidades) + secret (.git) + header (misconfig)
 
 #### `vulnscan` — Assessment de vulnerabilidades
 
