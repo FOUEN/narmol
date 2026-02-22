@@ -138,6 +138,8 @@ CONFIGURATION:
    -flc, -field-config string    path to custom field configuration file
    -s, -strategy string          Visit strategy (depth-first, breadth-first) (default "depth-first")
    -iqp, -ignore-query-params    Ignore crawling same path with different query-param values
+   -fsu, -filter-similar         filter crawling of similar looking URLs (e.g., /users/123 and /users/456)
+   -fst, -filter-similar-threshold int  number of distinct values before a path position is treated as parameter (default 10)
    -tlsi, -tls-impersonate       enable experimental client hello (ja3) tls randomization
    -dr, -disable-redirects       disable following redirects (default false)
 
@@ -509,6 +511,21 @@ Automatic form filling is experimental feature.
 katana -u https://tesla.com -aff
 ```
 
+*`-filter-similar`*
+----
+
+Option to filter crawling of similar looking URLs by normalizing variable path segments. This detects IDs, UUIDs, hashes, dates, and other dynamic values, and also learns repeating patterns at runtime. For example, `/users/123` and `/users/456` are treated as the same endpoint.
+
+```
+katana -u https://tesla.com -fsu
+```
+
+The promotion threshold (how many distinct values at a path position before it's treated as a parameter) can be tuned with `-fst`. Lower values are more aggressive (fewer URLs crawled), higher values are more permissive. Default is `10`.
+
+```
+katana -u https://tesla.com -fsu -fst 5
+```
+
 ## Authenticated Crawling
 
 Authenticated crawling involves including custom headers or cookies in HTTP requests to access protected resources. These headers provide authentication or authorization information, allowing you to crawl authenticated content / endpoint. You can specify headers directly in the command line or provide them as a file with katana to perform authenticated crawling.
@@ -564,6 +581,9 @@ CONFIGURATION:
    -fc, -form-config string      path to custom form configuration file
    -flc, -field-config string    path to custom field configuration file
    -s, -strategy string          Visit strategy (depth-first, breadth-first) (default "depth-first")
+   -iqp, -ignore-query-params    Ignore crawling same path with different query-param values
+   -fsu, -filter-similar         filter crawling of similar looking URLs (e.g., /users/123 and /users/456)
+   -fst, -filter-similar-threshold int  number of distinct values before a path position is treated as parameter (default 10)
 ```
 
 ### Connecting to Active Browser Session

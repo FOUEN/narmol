@@ -12,6 +12,7 @@ import (
 	"github.com/projectdiscovery/katana/pkg/engine/parser"
 	"github.com/projectdiscovery/katana/pkg/output"
 	"github.com/projectdiscovery/katana/pkg/types"
+	"github.com/projectdiscovery/katana/pkg/utils"
 	mapsutil "github.com/projectdiscovery/utils/maps"
 )
 
@@ -20,6 +21,7 @@ type Headless struct {
 	options *types.CrawlerOptions
 
 	deduplicator *mapsutil.SyncLockMap[string, struct{}]
+	pathTrie     *utils.PathTrie
 
 	debugger *CrawlDebugger
 }
@@ -33,6 +35,9 @@ func New(options *types.CrawlerOptions) (*Headless, error) {
 		options: options,
 
 		deduplicator: mapsutil.NewSyncLockMap[string, struct{}](),
+	}
+	if options.Options.FilterSimilar {
+		headless.pathTrie = utils.NewPathTrie(options.Options.FilterSimilarThreshold)
 	}
 
 	// Show crawl debugger if verbose is enabled
@@ -177,10 +182,14 @@ func (h *Headless) performAdditionalAnalysis(rr *output.Result) []*output.Result
 
 	navigationRequests := make([]*output.Result, 0)
 	for _, resp := range newNavigations {
-		if _, ok := h.deduplicator.Get(resp.URL); ok {
+		dedupKey := resp.URL
+		if h.options.Options.FilterSimilar {
+			dedupKey = utils.FingerprintURL(dedupKey, h.pathTrie)
+		}
+		if _, ok := h.deduplicator.Get(dedupKey); ok {
 			continue
 		}
-		if err := h.deduplicator.Set(resp.URL, struct{}{}); err != nil {
+		if err := h.deduplicator.Set(dedupKey, struct{}{}); err != nil {
 			h.logger.Debug("deduplicator set failed",
 				slog.String("url", resp.URL),
 				slog.String("error", err.Error()),

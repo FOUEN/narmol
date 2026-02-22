@@ -56,8 +56,18 @@ func UpdateAll(baseDir string) {
 		}
 
 		// Nuclei-specific: remove benchmark test that causes package conflicts
+		// and fix int→int64 type mismatches in gitlab tracker.
 		if tool.Name == "nuclei" {
 			os.Remove(filepath.Join(dir, "cmd", "nuclei", "main_benchmark_test.go"))
+			PatchNucleiGitlab(dir)
+		}
+
+		// Trufflehog-specific: move init() body into Main() so kingpin doesn't
+		// intercept narmol's CLI args at import time. Also remove test files
+		// that contain sample secrets (blocked by GitHub Push Protection).
+		if tool.Name == "trufflehog" {
+			PatchTrufflehogInit(dir, tool.MainFile)
+			RemoveTestFiles(dir)
 		}
 	}
 }

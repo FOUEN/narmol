@@ -157,16 +157,15 @@ func (i *Integration) CloseIssue(event *output.ResultEvent) error {
 }
 
 func (i *Integration) findIssueByTitle(title string) (*gitlab.Issue, error) {
-	pageSizeInt := i.options.DuplicateIssuePageSize
-	if pageSizeInt <= 0 {
-		pageSizeInt = 100
+	pageSize := i.options.DuplicateIssuePageSize
+	if pageSize <= 0 {
+		pageSize = 100
 	}
-	pageSize := int64(pageSizeInt)
-	maxPages := int64(i.options.DuplicateIssueMaxPages)
+	maxPages := i.options.DuplicateIssueMaxPages
 
 	searchIn := "title"
 	searchState := "all"
-	var page int64 = 1
+	page := 1
 
 	for {
 		if maxPages > 0 && page > maxPages {
@@ -178,8 +177,8 @@ func (i *Integration) findIssueByTitle(title string) (*gitlab.Issue, error) {
 			State:  &searchState,
 			Search: &title,
 			ListOptions: gitlab.ListOptions{
-				Page:    page,
-				PerPage: pageSize,
+				Page:    int64(page),
+				PerPage: int64(pageSize),
 			},
 		})
 		if err != nil {
@@ -192,7 +191,7 @@ func (i *Integration) findIssueByTitle(title string) (*gitlab.Issue, error) {
 			}
 		}
 
-		if int64(len(issues)) < pageSize {
+		if len(issues) < pageSize {
 			return nil, nil
 		}
 

@@ -278,7 +278,16 @@ var (
 	usingTUI   = false
 )
 
-func init() {
+
+// syncLogs flushes logs when the program exits.
+func syncLogs(syncFn func() error) {
+	if syncFn != nil {
+		_ = syncFn()
+	}
+}
+
+func Main() {
+	// ── CLI initialization (moved from init to avoid intercepting narmol's args) ──
 	_, _ = maxprocs.Set()
 
 	for i, arg := range os.Args {
@@ -348,16 +357,9 @@ func init() {
 	if *noColor || *noColour {
 		color.NoColor = true // disables colorized output
 	}
-}
 
-// syncLogs flushes logs when the program exits.
-func syncLogs(syncFn func() error) {
-	if syncFn != nil {
-		_ = syncFn()
-	}
-}
+	// ── End CLI initialization ──
 
-func Main() {
 	// setup logger
 	logFormat := log.WithConsoleSink
 	if *jsonOut {

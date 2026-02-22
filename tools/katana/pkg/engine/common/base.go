@@ -33,6 +33,7 @@ type Shared struct {
 	KnownFiles *files.KnownFiles
 	Options    *types.CrawlerOptions
 	Jar        *httputil.CookieJar
+	PathTrie   *utils.PathTrie
 }
 
 // NewShared creates a new Shared instance with the provided crawler options.
@@ -57,6 +58,10 @@ func NewShared(options *types.CrawlerOptions) (*Shared, error) {
 		return nil, errkit.Wrap(err, "could not create cookie jar")
 	}
 	shared.Jar = jar
+
+	if options.Options.FilterSimilar {
+		shared.PathTrie = utils.NewPathTrie(options.Options.FilterSimilarThreshold)
+	}
 
 	return shared, nil
 }
@@ -87,6 +92,9 @@ func (s *Shared) Enqueue(queue *queue.Queue, navigationRequests ...*navigation.R
 		reqUrl := nr.RequestURL()
 		if s.Options.Options.IgnoreQueryParams {
 			reqUrl = utils.ReplaceAllQueryParam(reqUrl, "")
+		}
+		if s.Options.Options.FilterSimilar {
+			reqUrl = utils.FingerprintURL(reqUrl, s.PathTrie)
 		}
 
 		// Skip adding to the crawl queue when the maximum depth is exceeded.
@@ -125,7 +133,11 @@ func (s *Shared) Enqueue(queue *queue.Queue, navigationRequests ...*navigation.R
 					continue
 				}
 
-				if !s.Options.UniqueFilter.UniqueURL(extractedParentURL) {
+				checkURL := extractedParentURL
+				if s.Options.Options.FilterSimilar {
+					checkURL = utils.FingerprintURL(checkURL, s.PathTrie)
+				}
+				if !s.Options.UniqueFilter.UniqueURL(checkURL) {
 					continue
 				}
 				if !s.ValidateScope(extractedParentURL, nr.RootHostname) {
