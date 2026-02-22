@@ -177,27 +177,41 @@ narmol workflow secrets -s scope.txt -oj secrets.json
 
 Lightweight single-purpose workflows. Use standalone or as building blocks.
 
-| Workflow | What it does | Tools |
-|---|---|---|
-| `subdomains` | Subdomain enumeration (recursive, 3 rounds) + DNS resolution | subfinder + dnsx |
-| `alive` | Probe hosts for alive check | httpx |
-| `techdetect` | Fingerprint technologies on hosts | wappalyzergo (stdlib HTTP) |
-| `crawl` | Discover endpoints, links, JS files | katana |
-| `urls` | Historical + live URL collection (parallel) | gau + katana |
-| `headers` | Security headers, CORS, cookies, SSL/TLS audit | stdlib |
-| `takeover` | Subdomain takeover detection (45+ services) | stdlib (CNAME + NXDOMAIN) |
-| `gitexpose` | Detect exposed .git repos + secret scanning | stdlib + TruffleHog |
+```
+narmol workflow <name> -s scope.txt [-oj file.json]
+```
 
-```
-narmol workflow subdomains -s scope.txt -oj subs.json
-narmol workflow alive -s scope.txt -oj alive.json
-narmol workflow techdetect -s scope.txt -oj tech.json
-narmol workflow crawl -s scope.txt -oj crawl.json
-narmol workflow urls -s scope.txt -oj urls.json
-narmol workflow headers -s scope.txt -oj headers.json
-narmol workflow takeover -s scope.txt -oj takeover.json
-narmol workflow gitexpose -s scope.txt -oj gitexpose.json
-```
+#### `subdomains` — Subdomain Enumeration
+
+Recursive subfinder (3 rounds) + DNS resolution with dnsx (A + AAAA). Only enumeration, no probing.
+
+#### `alive` — Alive Check
+
+httpx probe with follow redirects. Returns URL, status code, title, webserver.
+
+#### `techdetect` — Technology Fingerprinting
+
+Fetches each host and runs wappalyzergo fingerprinting. Fallback HTTPS → HTTP. Pure stdlib HTTP.
+
+#### `crawl` — Endpoint Discovery
+
+Katana standard engine — crawls robots.txt, sitemap, links, JS files. Breadth-first, max depth 3.
+
+#### `urls` — URL Collection
+
+Collects URLs from historical sources (gau: Wayback, OTX, URLScan) + live crawl (katana). Both run **in parallel**.
+
+#### `headers` — Security Header Audit
+
+Pure stdlib checks: missing HSTS/CSP/X-Frame-Options, CORS misconfiguration, insecure cookies (HttpOnly, Secure, SameSite), SSL/TLS config (protocol version, weak ciphers, cert expiry, self-signed, hostname mismatch).
+
+#### `takeover` — Subdomain Takeover Detection
+
+Resolves CNAMEs and checks against 45+ vulnerable services (AWS S3, Azure, Heroku, GitHub Pages, Netlify, Vercel, etc.). NXDOMAIN on CNAME target = strong takeover indicator.
+
+#### `gitexpose` — Git Repository Exposure
+
+Checks `/.git/HEAD` and `/.git/config` for HTTP 200. If exposed, scans for leaked secrets using TruffleHog (800+ detectors).
 
 ---
 
