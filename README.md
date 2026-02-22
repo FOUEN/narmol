@@ -1,10 +1,8 @@
 # Narmol
 
-Narmol is a wrapper tool written in Go that bundles multiple security tools into a single binary. It provides a unified interface for running tools like nuclei, httpx, subfinder, amass, and others, as well as executing custom workflows with mandatory scope enforcement.
+All-in-one security toolkit. One binary, multiple tools, scope-enforced workflows.
 
-## Installation
-
-### Option A: From source (recommended)
+## Install
 
 ```bash
 git clone https://github.com/FOUEN/narmol.git
@@ -12,84 +10,54 @@ cd narmol
 go run . update
 ```
 
-This clones all tool repos, patches them, and builds the final binary automatically.
+This downloads all tools, patches them, and builds the `narmol` binary. Done.
 
-### Option B: `go install`
+> **Requirements**: Go 1.24+ and Git.
 
-```bash
-go install -tags bootstrap github.com/FOUEN/narmol@v0.1.0
-narmol update
-```
-
-The first command installs a **bootstrap binary** (without tools compiled in — only the `update` command works). Then `narmol update`:
-1. Clones the narmol source to `~/.narmol/src/`
-2. Downloads and patches all tool repos
-3. Rebuilds the binary with all tools compiled in
-4. Replaces the bootstrap binary automatically
-
-### Updating
-
-To update all tools to their latest versions later:
+## Update
 
 ```bash
 narmol update
 ```
-
-> **Requirements**: Go 1.24+ and Git must be installed.
-
-## Project Structure
-
-- main.go: Entry point of the application.
-- go.work: Go workspace configuration.
-- tools/: Contains the source code for bundled tools (amass, dnsx, gau, httpx, katana, nuclei, subfinder, wappalyzergo).
-- workflows/: Contains the workflow registry and implementations.
-  - registry.go: Interface and registry for workflows.
-  - active/: Implementation of the "active" workflow.
-- scope/: Middleware package for handling scope parsing and matching.
 
 ## Tools
 
-You can run individual tools directly using the narmol binary:
+Run any tool directly:
 
-- amass
-- nuclei
-- httpx
-- katana
-- dnsx
-- subfinder
-- gau
-
-Example:
+```
 narmol subfinder -d example.com
+narmol nuclei -u https://example.com
+narmol httpx -l hosts.txt
+narmol katana -u https://example.com
+narmol dnsx -l domains.txt
+narmol amass enum -d example.com
+narmol gau example.com
+```
 
 ## Workflows
 
-Workflows are predefined sequences of tools that automate specific tasks. All workflows require a scope file to be defined.
+Automated tool chains with mandatory scope enforcement.
 
-Usage:
-narmol workflow <name> --scope <scope_file> [-o <output_dir>]
+```
+narmol workflow <name> -s <scope.txt> [-o [file]] [-oj [file]]
+```
 
-Available workflows:
-- active: Finds all subdomains using subfinder and checks which are active (alive) using httpx. output is in JSON format.
+### active
 
-## Scope System
+Finds subdomains (subfinder) and probes which are alive (httpx).
 
-The scope system enforces which targets can be audited. It supports wildcards and exclusions. Exclusions always take priority over inclusions.
+```
+narmol workflow active -s scope.txt -oj results.json
+```
 
-Flag: --scope (or -s)
+## Scope
 
-Scope File Format Example (scope.txt):
-# Wildcard: all subdomains of example.com
+All workflows require a scope file. Exclusions always take priority.
+
+```
+# scope.txt
 *.example.com
-
-# Explicit domain
-api.otherdomain.com
-
-# Exclusions (prefixed with -)
+api.other.com
 -admin.example.com
 -*.staging.example.com
-
-## Building
-
-To build the project, run:
-go build -o narmol.exe .
+```

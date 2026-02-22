@@ -1,5 +1,3 @@
-//go:build !bootstrap
-
 package active
 
 import (
@@ -8,11 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
-	"syscall"
 
 	"github.com/FOUEN/narmol/internal/scope"
 	"github.com/FOUEN/narmol/internal/workflows"
@@ -28,8 +23,8 @@ func init() {
 }
 
 // ActiveWorkflow finds all subdomains for a domain and probes which ones are active.
-// Subfinder and httpx run concurrently: as subdomains are discovered they are
-// immediately streamed to httpx for probing, eliminating the wait between steps.
+// Step 1: subfinder discovers subdomains, filtering through scope.
+// Step 2: httpx probes all in-scope hosts to find active ones.
 type ActiveWorkflow struct{}
 
 func (w *ActiveWorkflow) Name() string {
@@ -37,7 +32,7 @@ func (w *ActiveWorkflow) Name() string {
 }
 
 func (w *ActiveWorkflow) Description() string {
-	return "Find all subdomains and check which are active (alive). Runs subfinder->httpx as a concurrent pipeline."
+	return "Find all subdomains and check which are active (alive). Runs subfinder then httpx."
 }
 
 func (w *ActiveWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOptions) error {
@@ -49,27 +44,56 @@ func (w *ActiveWorkflow) Run(domain string, s *scope.Scope, opts workflows.Outpu
 		return fmt.Errorf("active workflow requires a wildcard scope (*.%s) to invoke subdomain enumeration", domain)
 	}
 
-	// Temp directory for the FIFO
-	tmpDir, err := os.MkdirTemp("", "narmol-active-*")
+	// ── Step 1: Subfinder ─────────────────────────────────────────────
+	fmt.Println("[*] Running subfinder...")
+
+	var totalFound, inScope, excluded int64
+	var hosts []string
+
+	sfOptions := &subfinder_runner.Options{
+		Domain:             goflags.StringSlice{domain},
+		Silent:             true,
+		All:                false,
+		Timeout:            30,
+		MaxEnumerationTime: 10,
+		Threads:            10,
+		DisableUpdateCheck: true,
+		Output:             io.Discard,
+		ProviderConfig:     "",
+		ResultCallback: func(result *resolve.HostEntry) {
+			atomic.AddInt64(&totalFound, 1)
+			host := strings.TrimSpace(result.Host)
+			if host == "" {
+				return
+			}
+			if !s.IsInScope(host) {
+				atomic.AddInt64(&excluded, 1)
+				return
+			}
+			atomic.AddInt64(&inScope, 1)
+			hosts = append(hosts, host)
+		},
+	}
+
+	sfRunner, err := subfinder_runner.NewRunner(sfOptions)
 	if err != nil {
-		return fmt.Errorf("failed to create temp dir: %w", err)
+		return fmt.Errorf("could not create subfinder runner: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
-
-	// Create a named pipe (FIFO)
-	// Subfinder writes in-scope hosts here; httpx reads from it in stream mode.
-	fifoPath := filepath.Join(tmpDir, "pipeline.fifo")
-	if err := syscall.Mkfifo(fifoPath, 0600); err != nil {
-		return fmt.Errorf("failed to create FIFO: %w", err)
+	if err := sfRunner.RunEnumerationWithCtx(context.Background()); err != nil {
+		return fmt.Errorf("subfinder enumeration failed: %w", err)
 	}
 
-	// Counters for the summary line
-	var totalFound int64
-	var inScope int64
-	var excluded int64
-	var activeCount int64
+	fmt.Printf("[+] Subfinder found %d subdomains -- %d in scope, %d excluded\n",
+		totalFound, inScope, excluded)
 
-	// Open output files up front so we can stream results into them.
+	if len(hosts) == 0 {
+		return fmt.Errorf("no subdomains remaining after scope filtering")
+	}
+
+	// ── Step 2: httpx ─────────────────────────────────────────────────
+	fmt.Printf("[*] Probing %d hosts with httpx...\n", len(hosts))
+
+	// Open output files
 	var textFile, jsonFile *os.File
 	if opts.TextFile != "" {
 		textFile, err = os.OpenFile(opts.TextFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -86,165 +110,67 @@ func (w *ActiveWorkflow) Run(domain string, s *scope.Scope, opts workflows.Outpu
 		defer jsonFile.Close()
 	}
 
-	// Goroutine: httpx (consumer)
-	// httpx opens the FIFO for reading in Stream mode. It blocks until the
-	// writer (subfinder goroutine) also opens the FIFO.
-	// OnResult streams each result to output files/stdout in real time.
-	var httpxErr error
-	var httpxWg sync.WaitGroup
-	httpxWg.Add(1)
+	var activeCount int64
 
-	go func() {
-		defer httpxWg.Done()
-
-		hxOptions := &httpx_runner.Options{
-			InputFile:          fifoPath,
-			Silent:             true,
-			DisableStdout:      true,
-			Stream:             true,
-			Threads:            50,
-			Timeout:            10,
-			DisableUpdateCheck: true,
-			DisableStdin:       true,
-			NoColor:            true,
-			FollowRedirects:    true,
-			MaxRedirects:       10,
-			RateLimit:          150,
-			Retries:            0,
-			HostMaxErrors:      30,
-			RandomAgent:        true,
-			TechDetect:         true,
-			OutputCDN:          "true",
-			ExtractTitle:       true,
-			OnResult: func(r httpx_runner.Result) {
-				if r.Err != nil {
-					return
-				}
-				// Compact the full httpx result to essential fields
-				compact := compactFromResult(r)
-				atomic.AddInt64(&activeCount, 1)
-
-				// Stream to stdout (default)
-				if textFile == nil && jsonFile == nil {
-					fmt.Println(compact.URL)
-				}
-				// Stream to text file
-				if textFile != nil {
-					fmt.Fprintln(textFile, compact.URL)
-				}
-				// Stream to JSON file
-				if jsonFile != nil {
-					if js, err := json.Marshal(compact); err == nil {
-						fmt.Fprintln(jsonFile, string(js))
-					}
-				}
-			},
-		}
-
-		if err := hxOptions.ValidateOptions(); err != nil {
-			httpxErr = fmt.Errorf("httpx options validation failed: %w", err)
-			if f, openErr := os.Open(fifoPath); openErr == nil {
-				f.Close()
+	hxOptions := &httpx_runner.Options{
+		InputTargetHost:    goflags.StringSlice(hosts),
+		Silent:             true,
+		DisableStdout:      true,
+		Threads:            50,
+		Timeout:            10,
+		DisableUpdateCheck: true,
+		DisableStdin:       true,
+		NoColor:            true,
+		FollowRedirects:    true,
+		MaxRedirects:       10,
+		RateLimit:          150,
+		Retries:            0,
+		HostMaxErrors:      30,
+		RandomAgent:        true,
+		TechDetect:         true,
+		OutputCDN:          "true",
+		ExtractTitle:       true,
+		OnResult: func(r httpx_runner.Result) {
+			if r.Err != nil {
+				return
 			}
-			return
-		}
+			compact := compactFromResult(r)
+			atomic.AddInt64(&activeCount, 1)
 
-		hxRunner, err := httpx_runner.New(hxOptions)
-		if err != nil {
-			httpxErr = fmt.Errorf("could not create httpx runner: %w", err)
-			if f, openErr := os.Open(fifoPath); openErr == nil {
-				f.Close()
+			if textFile == nil && jsonFile == nil {
+				fmt.Println(compact.URL)
 			}
-			return
-		}
-
-		hxRunner.RunEnumeration()
-		hxRunner.Close()
-	}()
-
-	// Goroutine: subfinder (producer)
-	// Opens the FIFO for writing and pushes every in-scope subdomain through it.
-	fmt.Println("[*] Pipeline started: subfinder -> scope filter -> httpx (concurrent)")
-
-	var subfinderErr error
-	var sfWg sync.WaitGroup
-	sfWg.Add(1)
-
-	go func() {
-		defer sfWg.Done()
-
-		// Open the write end of the FIFO (blocks until httpx opens the read end)
-		fifoWriter, err := os.OpenFile(fifoPath, os.O_WRONLY, os.ModeNamedPipe)
-		if err != nil {
-			subfinderErr = fmt.Errorf("failed to open FIFO for writing: %w", err)
-			return
-		}
-		defer fifoWriter.Close()
-
-		sfOptions := &subfinder_runner.Options{
-			Domain:             goflags.StringSlice{domain},
-			Silent:             true,
-			All:                false,
-			Timeout:            30,
-			MaxEnumerationTime: 10,
-			Threads:            10,
-			DisableUpdateCheck: true,
-			Output:             io.Discard,
-			ProviderConfig:     "",
-			ResultCallback: func(result *resolve.HostEntry) {
-				atomic.AddInt64(&totalFound, 1)
-				host := strings.TrimSpace(result.Host)
-				if host == "" {
-					return
+			if textFile != nil {
+				fmt.Fprintln(textFile, compact.URL)
+			}
+			if jsonFile != nil {
+				if js, err := json.Marshal(compact); err == nil {
+					fmt.Fprintln(jsonFile, string(js))
 				}
-				if !s.IsInScope(host) {
-					atomic.AddInt64(&excluded, 1)
-					return
-				}
-				atomic.AddInt64(&inScope, 1)
-				fmt.Fprintln(fifoWriter, host)
-			},
-		}
-
-		sfRunner, err := subfinder_runner.NewRunner(sfOptions)
-		if err != nil {
-			subfinderErr = fmt.Errorf("could not create subfinder runner: %w", err)
-			return
-		}
-
-		if err := sfRunner.RunEnumerationWithCtx(context.Background()); err != nil {
-			subfinderErr = fmt.Errorf("subfinder enumeration failed: %w", err)
-			return
-		}
-	}()
-
-	// Wait for subfinder to finish (closes the FIFO write end -> EOF for httpx)
-	sfWg.Wait()
-	// Then wait for httpx to drain remaining targets
-	httpxWg.Wait()
-
-	// Error handling
-	if subfinderErr != nil {
-		return subfinderErr
-	}
-	if httpxErr != nil {
-		return httpxErr
+			}
+		},
 	}
 
-	fmt.Printf("[+] Subfinder found %d subdomains -- %d in scope, %d excluded\n",
-		atomic.LoadInt64(&totalFound), atomic.LoadInt64(&inScope), atomic.LoadInt64(&excluded))
-
-	if atomic.LoadInt64(&inScope) == 0 {
-		return fmt.Errorf("no subdomains remaining after scope filtering")
+	if err := hxOptions.ValidateOptions(); err != nil {
+		return fmt.Errorf("httpx options validation failed: %w", err)
 	}
 
+	hxRunner, err := httpx_runner.New(hxOptions)
+	if err != nil {
+		return fmt.Errorf("could not create httpx runner: %w", err)
+	}
+
+	hxRunner.RunEnumeration()
+	hxRunner.Close()
+
+	// ── Summary ───────────────────────────────────────────────────────
 	active := atomic.LoadInt64(&activeCount)
 
 	if opts.JSONFile != "" {
-		fmt.Printf("[+] JSON results streamed to: %s\n", opts.JSONFile)
+		fmt.Printf("[+] JSON results saved to: %s\n", opts.JSONFile)
 	}
 	if opts.TextFile != "" {
-		fmt.Printf("[+] Text results streamed to: %s\n", opts.TextFile)
+		fmt.Printf("[+] Text results saved to: %s\n", opts.TextFile)
 	}
 
 	fmt.Printf("[+] Workflow 'active' completed -- %d active hosts found.\n", active)
