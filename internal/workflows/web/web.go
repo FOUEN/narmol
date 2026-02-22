@@ -112,13 +112,15 @@ func (w *WebWorkflow) Run(domain string, s *scope.Scope, opts workflows.OutputOp
 
 	// ── Step 3: katana — crawl live hosts ─────────────────────────────
 	endpoints := w.runKatana(liveHosts, s, emitUnique)
+	_ = endpoints // crawled endpoints are emitted for output but nuclei only needs base hosts
 
-	// Merge all unique URLs for nuclei (live hosts + crawled endpoints)
-	allTargets := mergeUnique(liveHosts, endpoints)
-	fmt.Printf("[+] %d total unique targets for nuclei\n", len(allTargets))
+	// Nuclei templates already contain the paths to probe (/.env, /wp-admin/, etc.)
+	// Passing all crawled endpoints (JS, CSS, images, API paths) would multiply
+	// scan time by orders of magnitude for no real gain.
+	fmt.Printf("[+] %d live hosts as nuclei targets (crawled %d endpoints)\n", len(liveHosts), len(endpoints))
 
 	// ── Step 4: nuclei — vulnerability scan ───────────────────────────
-	vulnCount := w.runNuclei(allTargets, emitUnique)
+	vulnCount := w.runNuclei(liveHosts, emitUnique)
 
 	// ── Summary ───────────────────────────────────────────────────────
 	if opts.TextFile != "" {
@@ -411,19 +413,4 @@ func appendUnique(slice []string, item string) []string {
 		}
 	}
 	return append(slice, item)
-}
-
-func mergeUnique(a, b []string) []string {
-	set := make(map[string]struct{}, len(a)+len(b))
-	for _, s := range a {
-		set[s] = struct{}{}
-	}
-	for _, s := range b {
-		set[s] = struct{}{}
-	}
-	result := make([]string, 0, len(set))
-	for s := range set {
-		result = append(result, s)
-	}
-	return result
 }
