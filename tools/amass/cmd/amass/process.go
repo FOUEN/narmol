@@ -23,7 +23,8 @@ var engineInstance *amassengine.Engine
 func engineIsRunning() bool {
 	c := client.NewClient("http://127.0.0.1:4000/graphql")
 
-	if _, err := c.SessionStats(uuid.New()); err != nil && err.Error() == "invalid session token" {
+	_, err := c.SessionStats(uuid.New())
+	if err != nil && err.Error() == "invalid session token" {
 		return true
 	}
 	return false
@@ -37,12 +38,31 @@ func startEngineInProcess() error {
 		return fmt.Errorf("failed to create engine logger: %w", err)
 	}
 
-	e, err := amassengine.NewEngine(l)
-	if err != nil {
-		return fmt.Errorf("failed to start engine: %w", err)
+	fmt.Fprintf(os.Stderr, "[*] Starting Amass engine in-process...\n")
+
+	type engineResult struct {
+		engine *amassengine.Engine
+		err    error
 	}
-	engineInstance = e
-	return nil
+
+	ch := make(chan engineResult, 1)
+	go func() {
+		e, err := amassengine.NewEngine(l)
+		ch <- engineResult{engine: e, err: err}
+	}()
+
+	// Wait up to 2 minutes for the engine to start (plugin loading can be slow)
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			return fmt.Errorf("failed to start engine: %w", res.err)
+		}
+		engineInstance = res.engine
+		fmt.Fprintf(os.Stderr, "[+] Amass engine started\n")
+		return nil
+	case <-time.After(2 * time.Minute):
+		return fmt.Errorf("engine startup timed out after 2 minutes (plugins may be unreachable)")
+	}
 }
 
 // shutdownEngine gracefully shuts down the in-process engine if running.
@@ -54,11 +74,12 @@ func shutdownEngine() {
 }
 
 // waitForEngine polls the GraphQL endpoint until the engine responds or times out.
+// Only needed when checking for an externally-started engine.
 func waitForEngine() error {
 	t := time.NewTicker(500 * time.Millisecond)
 	defer t.Stop()
 
-	for range 120 { // 120 × 500ms = 60s max
+	for range 20 { // 20 × 500ms = 10s max
 		<-t.C
 		if engineIsRunning() {
 			return nil

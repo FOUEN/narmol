@@ -150,11 +150,6 @@ func Main() {
 				os.Exit(1)
 			}
 			defer shutdownEngine()
-			// Wait for the GraphQL endpoint to become available
-			if err := waitForEngine(); err != nil {
-				_, _ = afmt.R.Fprintf(color.Error, "The Amass engine did not respond: %v\n", err)
-				os.Exit(1)
-			}
 		}
 
 		enum.CLIWorkflow(cmdName, os.Args[2:])

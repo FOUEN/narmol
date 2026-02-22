@@ -66,7 +66,7 @@ func NewServer(logger *slog.Logger, d et.Dispatcher, mgr et.SessionManager) *Ser
 		cancel: cancel,
 		ch:     make(chan struct{}),
 		srv: &http.Server{
-			Addr:    ":4000",
+			Addr:    "127.0.0.1:4000",
 			Handler: mux,
 			BaseContext: func(l net.Listener) context.Context {
 				ctx = context.WithValue(ctx, keyServerAddr, l.Addr().String())
