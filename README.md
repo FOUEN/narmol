@@ -168,12 +168,35 @@ narmol workflow secrets -s scope.txt -oj secrets.json
 - Paths (`/`, `./`, `C:\`, `~`) → filesystem scan
 
 **Public API** for use by other workflows:
-- `secrets.ScanGitRepo(url)` — returns `[]secretResult`
-- `secrets.ScanPath(path)` — returns `[]secretResult`
+- `secrets.ScanGitRepo(url)` — returns `[]SecretResult`
+- `secrets.ScanPath(path)` — returns `[]SecretResult`
 
-**JSON output:**
-```json
-{"type":"secret","detector_type":"AWS","verified":false,"redacted":"AKIA****","source":"git","target":"https://github.com/org/repo"}
+---
+
+### Mini-Workflows
+
+Lightweight single-purpose workflows. Use standalone or as building blocks.
+
+| Workflow | What it does | Tools |
+|---|---|---|
+| `subdomains` | Subdomain enumeration (recursive, 3 rounds) + DNS resolution | subfinder + dnsx |
+| `alive` | Probe hosts for alive check | httpx |
+| `techdetect` | Fingerprint technologies on hosts | wappalyzergo (stdlib HTTP) |
+| `crawl` | Discover endpoints, links, JS files | katana |
+| `urls` | Historical + live URL collection (parallel) | gau + katana |
+| `headers` | Security headers, CORS, cookies, SSL/TLS audit | stdlib |
+| `takeover` | Subdomain takeover detection (45+ services) | stdlib (CNAME + NXDOMAIN) |
+| `gitexpose` | Detect exposed .git repos + secret scanning | stdlib + TruffleHog |
+
+```
+narmol workflow subdomains -s scope.txt -oj subs.json
+narmol workflow alive -s scope.txt -oj alive.json
+narmol workflow techdetect -s scope.txt -oj tech.json
+narmol workflow crawl -s scope.txt -oj crawl.json
+narmol workflow urls -s scope.txt -oj urls.json
+narmol workflow headers -s scope.txt -oj headers.json
+narmol workflow takeover -s scope.txt -oj takeover.json
+narmol workflow gitexpose -s scope.txt -oj gitexpose.json
 ```
 
 ---

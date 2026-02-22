@@ -78,12 +78,28 @@ narmol/
 │       ├── registry.go         # Workflow interface, OutputOptions, Register(), Get(), List() (sorted)
 │       ├── active/
 │       │   └── active.go       # ActiveWorkflow — subfinder→httpx (InputTargetHost, cross-platform)
+│       ├── alive/
+│       │   └── alive.go        # AliveWorkflow — httpx probe only
+│       ├── crawl/
+│       │   └── crawl.go        # CrawlWorkflow — katana crawling
+│       ├── gitexpose/
+│       │   └── gitexpose.go    # GitExposeWorkflow — .git exposure + TruffleHog secrets
+│       ├── headers/
+│       │   └── headers.go      # HeadersWorkflow — security headers + CORS + cookies + TLS
 │       ├── recon/
 │       │   └── recon.go        # ReconWorkflow — subfinder(+recursive)+gau, pasivo
 │       ├── secrets/
 │       │   └── secrets.go      # SecretsWorkflow — TruffleHog secret scanning (git repos, filesystem)
+│       ├── subdomains/
+│       │   └── subdomains.go   # SubdomainsWorkflow — subfinder recursive + dnsx resolution
+│       ├── takeover/
+│       │   └── takeover.go     # TakeoverWorkflow — CNAME takeover detection (45+ services)
+│       ├── techdetect/
+│       │   └── techdetect.go   # TechDetectWorkflow — wappalyzergo fingerprinting
+│       ├── urls/
+│       │   └── urls.go         # URLsWorkflow — gau + katana en paralelo
 │       └── web/
-│           └── web.go          # WebWorkflow — subfinder→httpx→katana→nuclei, full web audit
+│           └── web.go          # WebWorkflow — subfinder→httpx→nuclei+checks, full web audit
 │
 └── tools/                      # Repos clonados y parcheados (gestionados por narmol update)
     ├── dnsx/
@@ -130,8 +146,16 @@ import (
 	"github.com/FOUEN/narmol/internal/cli"
 	_ "github.com/FOUEN/narmol/internal/runner"
 	_ "github.com/FOUEN/narmol/internal/workflows/active"
+	_ "github.com/FOUEN/narmol/internal/workflows/alive"
+	_ "github.com/FOUEN/narmol/internal/workflows/crawl"
+	_ "github.com/FOUEN/narmol/internal/workflows/gitexpose"
+	_ "github.com/FOUEN/narmol/internal/workflows/headers"
 	_ "github.com/FOUEN/narmol/internal/workflows/recon"
 	_ "github.com/FOUEN/narmol/internal/workflows/secrets"
+	_ "github.com/FOUEN/narmol/internal/workflows/subdomains"
+	_ "github.com/FOUEN/narmol/internal/workflows/takeover"
+	_ "github.com/FOUEN/narmol/internal/workflows/techdetect"
+	_ "github.com/FOUEN/narmol/internal/workflows/urls"
 	_ "github.com/FOUEN/narmol/internal/workflows/web"
 )
 
@@ -538,11 +562,19 @@ Variables globales: `alwaysTags`, `techTagMap` (50+ entries), `requiredHeaders` 
 ```
 main.go
   ├── internal/cli
-  ├── internal/runner           (_)
-  ├── internal/workflows/active  (_)
-  ├── internal/workflows/recon   (_)
-  ├── internal/workflows/secrets (_)
-  └── internal/workflows/web     (_)
+  ├── internal/runner            (_)
+  ├── internal/workflows/active   (_)
+  ├── internal/workflows/alive    (_)
+  ├── internal/workflows/crawl    (_)
+  ├── internal/workflows/gitexpose(_)
+  ├── internal/workflows/headers  (_)
+  ├── internal/workflows/recon    (_)
+  ├── internal/workflows/secrets  (_)
+  ├── internal/workflows/subdomains(_)
+  ├── internal/workflows/takeover (_)
+  ├── internal/workflows/techdetect(_)
+  ├── internal/workflows/urls     (_)
+  └── internal/workflows/web      (_)
 
 internal/cli
   ├── internal/runner
@@ -554,6 +586,15 @@ internal/workflows/active
   ├── internal/scope
   ├── internal/workflows
   └── httpx/subfinder runners (external)
+
+internal/workflows/alive        → httpx runner
+internal/workflows/crawl        → katana engine
+internal/workflows/gitexpose    → internal/workflows/secrets + stdlib
+internal/workflows/headers      → stdlib (crypto/tls, net/http)
+internal/workflows/subdomains   → subfinder runner + dnsx library
+internal/workflows/takeover     → stdlib (net.LookupCNAME)
+internal/workflows/techdetect   → wappalyzergo + stdlib
+internal/workflows/urls         → gau runner + katana engine
 
 internal/workflows/recon
   ├── internal/scope
@@ -649,20 +690,14 @@ Fingerprint first, scan after. Pipeline: subfinder→httpx(fingerprint)→nuclei
 - [x] Dedup global por fase
 - [x] Output JSON: probe (live hosts + tech) + vuln (vulnerabilidades) + secret (.git) + header (misconfig)
 
-#### `vulnscan` — Assessment de vulnerabilidades
+#### `vulnscan` — ~~Deprecado~~ → absorbido por `web`
 
-Input: output del workflow `web` (hosts alive + URLs).
+Todo lo que iba a hacer `vulnscan` ya lo hace `web` directamente:
+- Nuclei targeted scan ✅ (`web`), Security headers ✅ (`web` + `headers`), CORS ✅ (`web` + `headers`)
+- Cookie flags ✅ (`web` + `headers`), SSL/TLS ✅ (`web` + `headers`), Open redirect ✅ (`web`)
+- HTTP smuggling ✅ (`web`), Git secrets ✅ (`web` + `gitexpose`)
 
-- [ ] Nuclei scan (severidad configurable, por defecto medium+)
-- [ ] Security headers check (X-Frame-Options, CSP, HSTS, X-Content-Type-Options, etc.)
-- [ ] CORS misconfiguration check
-- [ ] Cookie flags check (HttpOnly, Secure, SameSite)
-- [x] SSL/TLS config check (versión protocolo, ciphers, expiración certificado) — `runTLSChecks()` stdlib
-- [x] Open redirect check básico — `runOpenRedirectChecks()` stdlib, 18 params, canary evil.com
-- [x] HTTP request smuggling (CL.TE + TE.CL) — `runSmugglingChecks()` stdlib, raw TCP + timing
-- [ ] Secret scanning con TruffleHog (git repos expuestos, respuestas)
-- [ ] Scope filter en cada paso
-- [ ] Output JSON: vulnerabilidades categorizadas por severidad
+No se necesita un workflow separado.
 
 #### `full` — Scan completo
 
@@ -671,7 +706,6 @@ Orquesta todos los core workflows + soporte de IPs/CIDR.
 - [ ] Soporte de IPs individuales y CIDR en scope
 - [ ] Ejecutar `recon`
 - [ ] Ejecutar `web`
-- [ ] Ejecutar `vulnscan`
 - [ ] Secret scanning con TruffleHog (git repos, filesystem, crawled content)
 - [ ] Port scan en IPs/CIDR del scope (si aplica)
 - [ ] Output JSON unificado: superficie completa + vulnerabilidades
@@ -682,74 +716,72 @@ Orquesta todos los core workflows + soporte de IPs/CIDR.
 
 Workflows pequeños para tareas específicas. Se pueden usar standalone o como bloques reutilizables desde los core workflows.
 
-#### `active` ✅ (ya implementado)
+#### `active` ✅ (implementado)
 
 Subfinder → httpx. Descubre subdominios y comprueba cuáles tienen servicio web.
 
-#### `subdomains`
+#### `subdomains` ✅ (implementado)
 
-Solo enumeración de subdominios (pasivo + activo), sin probing.
+Subfinder recursivo (3 rounds) + resolución DNS con dnsx. Solo enumeración, sin probing.
 
-- [ ] Subfinder (pasivo)
-- [ ] Subfinder recursivo
-- [ ] Resolución DNS (dnsx)
-- [ ] Dedup + scope filter
-- [ ] Output: lista limpia de subdominios
+- [x] Subfinder (pasivo)
+- [x] Subfinder recursivo (3 rounds)
+- [x] Resolución DNS (dnsx library — A + AAAA)
+- [x] Dedup + scope filter
+- [x] Output JSON: subdomain + IPs resueltas
 
-#### `alive`
+#### `alive` ✅ (implementado)
 
-Solo comprobar qué hosts de una lista están activos.
+httpx probe — comprueba qué hosts están activos.
 
-- [ ] Input: lista de hosts (fichero o stdin)
-- [ ] httpx probe
-- [ ] Output: hosts alive con status code, título, server
+- [x] httpx probe con follow redirects
+- [x] Output: URL, status code, título, webserver
 
-#### `techdetect`
+#### `techdetect` ✅ (implementado)
 
-Detectar tecnologías en hosts alive.
+wappalyzergo fingerprinting directo sobre hosts alive.
 
-- [ ] Input: lista de URLs/hosts alive
-- [ ] wappalyzergo fingerprinting
-- [ ] Output JSON: host → tecnologías detectadas
+- [x] HTTP GET + wappalyzergo Fingerprint()
+- [x] Fallback HTTPS → HTTP
+- [x] Concurrencia con semáforo (20 goroutines)
+- [x] Output JSON: host → tecnologías detectadas
 
-#### `crawl`
+#### `crawl` ✅ (implementado)
 
-Crawling y extracción de endpoints.
+Katana standard engine — crawling de endpoints, links, JS files.
 
-- [ ] Input: lista de URLs alive
-- [ ] Katana crawl (robots.txt, sitemap, links, JS)
-- [ ] Extracción de endpoints JS
-- [ ] Extracción de parámetros JS
-- [ ] Output: URLs descubiertas
+- [x] Katana crawl (robots.txt, sitemap, links, JS via KnownFiles: "all")
+- [x] MaxDepth 3, breadth-first, scope filter
+- [x] Output JSON: URL + source + tag/attribute
 
-#### `urls`
+#### `urls` ✅ (implementado)
 
-Recolección de URLs históricas + crawling.
+gau (histórico) + katana (live crawl) en PARALELO.
 
-- [ ] gau (Wayback, Common Crawl, etc.)
-- [ ] katana crawl
-- [ ] Dedup + scope filter
-- [ ] Output: lista unificada de URLs
+- [x] gau (Wayback, OTX, URLScan)
+- [x] katana crawl
+- [x] Ambos en paralelo (goroutines)
+- [x] Dedup + scope filter
+- [x] Output JSON: URL + source
 
-#### `headers`
+#### `headers` ✅ (implementado)
 
-Auditoría de security headers y configuración.
+Auditoría completa de security headers, CORS, cookies, SSL/TLS. Pure stdlib.
 
-- [ ] Input: lista de URLs alive
-- [ ] Security headers check (CSP, HSTS, X-Frame, X-Content-Type, Referrer-Policy, Permissions-Policy)
-- [ ] Cookie flags check (HttpOnly, Secure, SameSite)
-- [ ] CORS misconfiguration check
-- [ ] SSL/TLS check (versión, ciphers, cert expiry)
-- [ ] Output JSON: findings por host
+- [x] Security headers (HSTS, CSP, X-Frame, X-Content-Type, Referrer-Policy, Permissions-Policy)
+- [x] Cookie flags (HttpOnly, Secure, SameSite)
+- [x] CORS misconfiguration (origin reflection, credentials)
+- [x] SSL/TLS (protocol version, weak ciphers, cert expiry, self-signed, hostname mismatch)
+- [x] Output JSON: findings por host con categoría
 
-#### `takeover`
+#### `takeover` ✅ (implementado)
 
-Detección de subdomain takeover.
+Subdomain takeover via CNAME resolution + NXDOMAIN check.
 
-- [ ] Input: lista de subdominios
-- [ ] Resolución CNAME
-- [ ] Check si el CNAME apunta a servicio abandonado (S3, GitHub Pages, Heroku, etc.)
-- [ ] Output: subdominios vulnerables + servicio
+- [x] Resolución CNAME (net.LookupCNAME)
+- [x] 45+ servicios vulnerables (AWS S3, Azure, Heroku, GitHub Pages, Netlify, Vercel, etc.)
+- [x] NXDOMAIN check = strong indicator
+- [x] Output JSON: subdomain, CNAME, servicio, severidad
 
 #### `secrets` ✅ (implementado)
 
@@ -761,11 +793,11 @@ Escaneo de secretos filtrados usando TruffleHog (800+ detectores).
 - [x] Output JSON: tipo detector, verificado, redactado, fuente
 - [x] API pública (`ScanGitRepo()`, `ScanPath()`) para uso desde otros workflows
 
-#### `gitexpose`
+#### `gitexpose` ✅ (implementado)
 
-Detección de repositorios git expuestos + escaneo de secretos.
+.git exposure check + TruffleHog secret scanning.
 
-- [ ] Input: lista de URLs alive
-- [ ] Check `/.git/HEAD`, `/.git/config`
-- [ ] Si `.git` expuesto → scan con TruffleHog para secretos
-- [ ] Output: hosts con git expuesto + secretos encontrados
+- [x] Check `/.git/HEAD`, `/.git/config` (HTTP 200 = exposed)
+- [x] Si `.git` expuesto → scan con TruffleHog para secretos
+- [x] Concurrencia con semáforo (20 goroutines)
+- [x] Output JSON: phase (exposed/secret) + severity + detail
